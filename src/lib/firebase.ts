@@ -3,15 +3,16 @@ import { getAuth, GoogleAuthProvider, signInWithPopup, signOut } from "firebase/
 import { getMessaging, getToken, onMessage } from "firebase/messaging";
 import { getFirestore, collection, doc, setDoc, deleteDoc, getDocs, query, where } from "firebase/firestore";
 
-// Client-side Firebase Configuration (Provided by User)
+// Client-side Firebase Configuration — loaded from environment variables (.env)
+// Keys are NOT hardcoded to prevent accidental exposure in public repositories.
 const firebaseConfig = {
-  apiKey: "AIzaSyCwiT0N9yYTme8xxoyS6XlVQncNsEXqjFU",
-  authDomain: "retrack-b3275.firebaseapp.com",
-  projectId: "retrack-b3275",
-  storageBucket: "retrack-b3275.firebasestorage.app",
-  messagingSenderId: "778757546027",
-  appId: "1:778757546027:web:9a50c25d714723dde1ca6e",
-  measurementId: "G-VCKJ382QM7",
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+  measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID,
 };
 
 export const app = initializeApp(firebaseConfig);
@@ -38,7 +39,8 @@ export const logout = async () => {
 };
 
 // VAPID Key dari Firebase Console > Project Settings > Cloud Messaging > Web Push certificates
-const VAPID_KEY = "BLb7yn0xbImA4RV015UHTXc8yRWzEkL2t1Bkn7V95C8ddEMiIcMOXOyY3brpFkmLbvIdipGz8jFeC8dOoA0SA-o";
+// Loaded from environment variable to avoid hardcoding in source code.
+const VAPID_KEY = import.meta.env.VITE_FIREBASE_VAPID_KEY;
 
 export const requestNotificationPermissionAndGetToken = async (): Promise<string | null> => {
   try {
@@ -53,6 +55,21 @@ export const requestNotificationPermissionAndGetToken = async (): Promise<string
       try {
         swRegistration = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
         console.log("Service Worker registered successfully:", swRegistration);
+
+        // Send Firebase config to service worker (so it doesn't need hardcoded keys)
+        const activeWorker = swRegistration.active || swRegistration.installing || swRegistration.waiting;
+        if (activeWorker) {
+          activeWorker.postMessage({ type: "FIREBASE_CONFIG", config: firebaseConfig });
+        }
+        // Also listen for new activations to send config
+        swRegistration.addEventListener("updatefound", () => {
+          const newWorker = swRegistration?.installing;
+          newWorker?.addEventListener("statechange", () => {
+            if (newWorker.state === "activated") {
+              newWorker.postMessage({ type: "FIREBASE_CONFIG", config: firebaseConfig });
+            }
+          });
+        });
       } catch (swErr) {
         console.error("Service Worker registration failed:", swErr);
       }

@@ -284,14 +284,22 @@ const MapCanvas = ({
     const newObstacles = generateInitialObstacles(startLat, startLng, target.latitude, target.longitude);
     const existingObstacles = simulation?.obstacles || [];
     const allObstacles = [...existingObstacles, ...newObstacles];
-    const apiKey = "daab02fe82f54d7099d94b0ce9fcecb6";
     const avoidStr = allObstacles.map(o => `location:${o.lat},${o.lng}`).join('|');
+    const waypointsStr = `${startLat},${startLng}|${target.latitude},${target.longitude}`;
 
     try {
-      // Parallel fetch: AI best route (avoiding obstacles) + naive route (for rejected comparison)
+      // Parallel fetch via server proxy: AI best route (avoiding obstacles) + naive route (for rejected comparison)
       const [bestRes, naiveRes] = await Promise.all([
-        fetch(`https://api.geoapify.com/v1/routing?waypoints=${startLat},${startLng}|${target.latitude},${target.longitude}&mode=drive&avoid=${avoidStr}&apiKey=${apiKey}`),
-        fetch(`https://api.geoapify.com/v1/routing?waypoints=${startLat},${startLng}|${target.latitude},${target.longitude}&mode=drive&apiKey=${apiKey}`)
+        fetch("/api/geoapify-route", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ waypoints: waypointsStr, mode: "drive", avoid: avoidStr })
+        }),
+        fetch("/api/geoapify-route", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ waypoints: waypointsStr, mode: "drive" })
+        })
       ]);
       const [bestData, naiveData] = await Promise.all([bestRes.json(), naiveRes.json()]);
 
@@ -411,7 +419,6 @@ const MapCanvas = ({
          const destLng = simulation.destLng;
 
          try {
-           const apiKey = "daab02fe82f54d7099d94b0ce9fcecb6";
            const obstacleLat = obstacleLoc[0];
            const obstacleLng = obstacleLoc[1];
 
@@ -419,9 +426,13 @@ const MapCanvas = ({
            const newObstacle = { lat: obstacleLat, lng: obstacleLng, type: evtMessage || "Obstacle" };
            const allObstacles = [...simulation.obstacles, newObstacle];
            const avoidStr = allObstacles.map(o => `location:${o.lat},${o.lng}`).join('|');
+           const waypointsStr = `${currentLoc[0]},${currentLoc[1]}|${destLat},${destLng}`;
            
-           const url = `https://api.geoapify.com/v1/routing?waypoints=${currentLoc[0]},${currentLoc[1]}|${destLat},${destLng}&mode=drive&avoid=${avoidStr}&apiKey=${apiKey}`;
-           const res = await fetch(url);
+           const res = await fetch("/api/geoapify-route", {
+             method: "POST",
+             headers: { "Content-Type": "application/json" },
+             body: JSON.stringify({ waypoints: waypointsStr, mode: "drive", avoid: avoidStr })
+           });
            const data = await res.json();
            
            if (data.features && data.features.length > 0) {
@@ -443,8 +454,11 @@ const MapCanvas = ({
            } else {
              // Fallback: use fewer obstacles if too many cause routing failure
              const recentAvoidStr = allObstacles.slice(-5).map(o => `location:${o.lat},${o.lng}`).join('|');
-             const fallbackUrl = `https://api.geoapify.com/v1/routing?waypoints=${currentLoc[0]},${currentLoc[1]}|${destLat},${destLng}&mode=drive&avoid=${recentAvoidStr}&apiKey=${apiKey}`;
-             const fbRes = await fetch(fallbackUrl);
+             const fbRes = await fetch("/api/geoapify-route", {
+               method: "POST",
+               headers: { "Content-Type": "application/json" },
+               body: JSON.stringify({ waypoints: waypointsStr, mode: "drive", avoid: recentAvoidStr })
+             });
              const fbData = await fbRes.json();
              if (fbData.features && fbData.features.length > 0) {
                let fbCoordsList = fbData.features[0].geometry.coordinates;

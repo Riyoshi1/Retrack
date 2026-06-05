@@ -126,6 +126,35 @@ async function startServer() {
 
   app.use(express.json());
 
+  // --- Geoapify Routing Proxy ---
+  // Proxies routing requests to Geoapify, injecting the API key server-side.
+  // This prevents the Geoapify API key from being exposed in the browser.
+  app.post("/api/geoapify-route", async (req, res) => {
+    try {
+      const { waypoints, mode, avoid } = req.body;
+      const apiKey = process.env.GEOAPIFY_API_KEY;
+
+      if (!apiKey) {
+        return res.status(500).json({ error: "GEOAPIFY_API_KEY not configured on server." });
+      }
+      if (!waypoints) {
+        return res.status(400).json({ error: "waypoints is required." });
+      }
+
+      let url = `https://api.geoapify.com/v1/routing?waypoints=${waypoints}&mode=${mode || "drive"}&apiKey=${apiKey}`;
+      if (avoid) {
+        url += `&avoid=${avoid}`;
+      }
+
+      const response = await fetch(url);
+      const data = await response.json();
+      return res.json(data);
+    } catch (error: any) {
+      console.error("Geoapify proxy error:", error);
+      return res.status(500).json({ error: "Failed to fetch route from Geoapify." });
+    }
+  });
+
   // --- Firebase Push Notification Endpoints ---
   // --- Push Notifications & Device Tokens ---
   app.post("/api/users/:uid/tokens", async (req, res) => {
