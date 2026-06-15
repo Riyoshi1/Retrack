@@ -3,8 +3,7 @@ import { getAuth, GoogleAuthProvider, signInWithPopup, signOut } from "firebase/
 import { getMessaging, getToken, onMessage } from "firebase/messaging";
 import { getFirestore, collection, doc, setDoc, deleteDoc, getDocs, query, where } from "firebase/firestore";
 
-// Client-side Firebase Configuration — loaded from environment variables (.env)
-// Keys are NOT hardcoded to prevent accidental exposure in public repositories.
+// Client-side Firebase Configuration (Provided by User)
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
@@ -39,7 +38,6 @@ export const logout = async () => {
 };
 
 // VAPID Key dari Firebase Console > Project Settings > Cloud Messaging > Web Push certificates
-// Loaded from environment variable to avoid hardcoding in source code.
 const VAPID_KEY = import.meta.env.VITE_FIREBASE_VAPID_KEY;
 
 export const requestNotificationPermissionAndGetToken = async (): Promise<string | null> => {
@@ -55,21 +53,6 @@ export const requestNotificationPermissionAndGetToken = async (): Promise<string
       try {
         swRegistration = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
         console.log("Service Worker registered successfully:", swRegistration);
-
-        // Send Firebase config to service worker (so it doesn't need hardcoded keys)
-        const activeWorker = swRegistration.active || swRegistration.installing || swRegistration.waiting;
-        if (activeWorker) {
-          activeWorker.postMessage({ type: "FIREBASE_CONFIG", config: firebaseConfig });
-        }
-        // Also listen for new activations to send config
-        swRegistration.addEventListener("updatefound", () => {
-          const newWorker = swRegistration?.installing;
-          newWorker?.addEventListener("statechange", () => {
-            if (newWorker.state === "activated") {
-              newWorker.postMessage({ type: "FIREBASE_CONFIG", config: firebaseConfig });
-            }
-          });
-        });
       } catch (swErr) {
         console.error("Service Worker registration failed:", swErr);
       }
@@ -163,6 +146,17 @@ export const deleteActivityFromDb = async (activityId: string) => {
     console.log("Activity deleted successfully from DB");
   } catch (error) {
     console.error("Error deleting activity from DB:", error);
+    throw error;
+  }
+};
+
+export const updateActivityInDb = async (activityId: string, updatedData: any) => {
+  try {
+    const activityRef = doc(db, "activities", activityId);
+    await setDoc(activityRef, updatedData, { merge: true });
+    console.log("Activity updated successfully in DB");
+  } catch (error) {
+    console.error("Error updating activity in DB:", error);
     throw error;
   }
 };

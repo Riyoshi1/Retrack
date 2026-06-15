@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
@@ -28,8 +29,8 @@ function ensureAdminInitialized() {
       privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
     };
   } else {
-    console.error("Firebase credentials not found. Set FIREBASE_SERVICE_ACCOUNT or FIREBASE_PRIVATE_KEY environment variables.");
-    return false;
+    console.error("FIREBASE_SERVICE_ACCOUNT or FIREBASE_PRIVATE_KEY is missing from environment variables.");
+    throw new Error("Missing Firebase Admin credentials in .env");
   }
 
   try {
@@ -126,35 +127,6 @@ async function startServer() {
 
   app.use(express.json());
 
-  // --- Geoapify Routing Proxy ---
-  // Proxies routing requests to Geoapify, injecting the API key server-side.
-  // This prevents the Geoapify API key from being exposed in the browser.
-  app.post("/api/geoapify-route", async (req, res) => {
-    try {
-      const { waypoints, mode, avoid } = req.body;
-      const apiKey = process.env.GEOAPIFY_API_KEY;
-
-      if (!apiKey) {
-        return res.status(500).json({ error: "GEOAPIFY_API_KEY not configured on server." });
-      }
-      if (!waypoints) {
-        return res.status(400).json({ error: "waypoints is required." });
-      }
-
-      let url = `https://api.geoapify.com/v1/routing?waypoints=${waypoints}&mode=${mode || "drive"}&apiKey=${apiKey}`;
-      if (avoid) {
-        url += `&avoid=${avoid}`;
-      }
-
-      const response = await fetch(url);
-      const data = await response.json();
-      return res.json(data);
-    } catch (error: any) {
-      console.error("Geoapify proxy error:", error);
-      return res.status(500).json({ error: "Failed to fetch route from Geoapify." });
-    }
-  });
-
   // --- Firebase Push Notification Endpoints ---
   // --- Push Notifications & Device Tokens ---
   app.post("/api/users/:uid/tokens", async (req, res) => {
@@ -250,6 +222,47 @@ async function startServer() {
       return res.json({ success: true, messageId: response });
     } catch (error: any) {
       console.error("Error sending test message:", error);
+      return res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/notifications/send", async (req, res) => {
+    try {
+      const { uid, title, body } = req.body;
+      if (!uid || !title || !body) {
+        return res.status(400).json({ error: "UID, title, and body are required" });
+      }
+
+      if (!ensureAdminInitialized()) {
+        throw new Error("Admin SDK tidak terinisialisasi");
+      }
+      
+      const db = getFirestore();
+      const userDoc = await db.collection("users").doc(uid).get();
+      
+      if (!userDoc.exists) {
+        return res.status(404).json({ error: "User tidak ditemukan" });
+      }
+      
+      const tokens = userDoc.data()?.tokens || [];
+      if (tokens.length === 0) {
+        return res.json({ success: true, message: "Tidak ada token untuk dikirimkan notifikasi." });
+      }
+      
+      const message = {
+        notification: {
+          title: title,
+          body: body
+        },
+        tokens: tokens,
+      };
+      
+      const messaging = getMessaging();
+      const response = await messaging.sendEachForMulticast(message);
+      console.log(`${response.successCount} notifikasi (generic) berhasil dikirim kepada user ${uid}.`);
+      return res.json({ success: true, response });
+    } catch (error: any) {
+      console.error("Error sending generic notification:", error);
       return res.status(500).json({ error: error.message });
     }
   });
@@ -351,26 +364,35 @@ async function startServer() {
   app.post("/api/get_manual_route", async (req, res) => {
     try {
       const { activities } = req.body;
-      if (!activities || activities.length < 2) {
+      if (!activities || !Array.isArray(activities) || activities.length < 2) {
         return res.json({ coords: [] });
       }
 
-      const coordsStr = activities
-        .map((a: any) => `${a.location.longitude},${a.location.latitude}`)
-        .join(";");
+      const validActs = activities.filter((a: any) => a && a.location && a.location.longitude !== undefined && a.location.latitude !== undefined);
+      if (validActs.length < 2) {
+        return res.json({ coords: [] });
+      }
+
+      const coordsStr = validActs
+        .map((a: any) => `${a.location.latitude},${a.location.longitude}`)
+        .join("|");
       
-      const routeUrl = `https://router.project-osrm.org/route/v1/driving/${coordsStr}?overview=full&geometries=geojson`;
+      const apiKey = process.env.GEOAPIFY_API_KEY || "daab02fe82f54d7099d94b0ce9fcecb6";
+      const routeUrl = `https://api.geoapify.com/v1/routing?waypoints=${coordsStr}&mode=drive&apiKey=${apiKey}`;
       const rResponse = await fetch(routeUrl);
+      if (!rResponse.ok) {
+        console.error("Geoapify API Error in manual route!");
+        return res.json({ coords: validActs.map((a: any) => [a.location.latitude, a.location.longitude]) });
+      }
       const rData = await rResponse.json();
 
       let coords: any[] = [];
-      if (rData.code === "Ok" && rData.routes && rData.routes.length > 0) {
-        coords = rData.routes[0].geometry.coordinates.map((c: any[]) => [
-          c[1],
-          c[0],
-        ]);
+      if (rData.features && rData.features.length > 0) {
+        let cl = rData.features[0].geometry.coordinates;
+        if (rData.features[0].geometry.type === "MultiLineString") cl = cl.flat(1);
+        coords = cl.map((c: any[]) => [c[1], c[0]]);
       } else {
-        coords = activities.map((a: any) => [a.location.latitude, a.location.longitude]);
+        coords = validActs.map((a: any) => [a.location.latitude, a.location.longitude]);
       }
       res.json({ coords });
     } catch (e) {
@@ -430,59 +452,119 @@ async function startServer() {
 
       // 2. Parse Activities into FIXED and FLEXIBLE
       const fixedList = activities
-        .filter((a) => a.type === "FIXED" && a.timeWindow?.start)
+        .filter((a) => a.type === "FIXED" && a.timeWindow?.start && a.location)
         .sort((a, b) => timeToMins(a.timeWindow.start) - timeToMins(b.timeWindow.start));
 
-      const flexibleList = activities.filter((a) => a.type === "FLEXIBLE").slice(0, 8);
+      const flexibleList = activities.filter((a) => a.type === "FLEXIBLE" && a.location).slice(0, 8);
 
       // 3. Build Unified Location Map
       const allActs = [...fixedList, ...flexibleList];
       const n = allActs.length;
 
-      // 4. Matrix Call: Fetch OSRM distance and duration table
+      // 4. Fallback: Local Haversine Calculation
       let durations = Array(n).fill(0).map(() => Array(n).fill(0));
       let distances = Array(n).fill(0).map(() => Array(n).fill(0));
 
       if (n >= 2) {
-        try {
-          const coordsStr = allActs
-            .map((a: any) => `${a.location.longitude},${a.location.latitude}`)
-            .join(";");
-          const matrixUrl = `http://router.project-osrm.org/table/v1/driving/${coordsStr}?annotations=duration,distance`;
-          const mResponse = await fetch(matrixUrl);
-          const mData = await mResponse.json();
-
-          if (mData.code === "Ok" && mData.durations && mData.distances) {
-            for (let i = 0; i < n; i++) {
-              for (let j = 0; j < n; j++) {
-                const durSec = mData.durations[i][j] || 0;
-                const distMet = mData.distances[i][j] || 0;
-                durations[i][j] = i === j ? 0 : Math.max(1, Math.round(durSec / 60));
-                distances[i][j] = distMet;
-              }
-            }
-          }
-        } catch (err) {
-          console.error("OSRM table lookup failed, utilizing Haversine", err);
-          for (let i = 0; i < n; i++) {
-            for (let j = 0; j < n; j++) {
-              if (i === j) continue;
-              const dist = getDistance(
-                allActs[i].location.latitude,
-                allActs[i].location.longitude,
-                allActs[j].location.latitude,
-                allActs[j].location.longitude
-              );
-              distances[i][j] = dist;
-              durations[i][j] = Math.max(1, Math.round(dist / 583)); // 35km/h speed
-            }
+        for (let i = 0; i < n; i++) {
+          for (let j = 0; j < n; j++) {
+            if (i === j) continue;
+            const dist = getDistance(
+              allActs[i].location.latitude,
+              allActs[i].location.longitude,
+              allActs[j].location.latitude,
+              allActs[j].location.longitude
+            );
+            distances[i][j] = dist;
+            durations[i][j] = Math.max(1, Math.round(dist / 583)); // 35km/h avg speed
           }
         }
       }
 
-      // 5. Implement Chronological Sorting
+      // 5. Implement Scheduling Logic (Chronological + Flexible Placement)
+      let scheduledActs = [...fixedList];
+      const TRAVEL_PADDING_MINS = 15;
       let bestConflicts: any[] = [];
-      let optimizedSequence = [...allActs].filter(a => a.timeWindow?.start).sort((a, b) => {
+
+      const formatTime = (mins: number) => {
+        const h = Math.floor(mins / 60);
+        const m = mins % 60;
+        return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+      };
+
+      for (const flex of flexibleList) {
+        if (!flex.timeWindow?.start || !flex.timeWindow?.end) {
+          scheduledActs.push(flex);
+          continue;
+        }
+
+        const flexBoundStart = timeToMins(flex.timeWindow.start);
+        const flexBoundEnd = timeToMins(flex.timeWindow.end);
+        const flexDuration = flex.durationMinutes || 60;
+
+        let bestStart = -1;
+
+        // Collect all occupied intervals with padding
+        const busyIntervals = scheduledActs.map(a => {
+          if (!a.timeWindow?.start || !a.timeWindow?.end) return null;
+          return {
+            start: timeToMins(a.timeWindow.start) - TRAVEL_PADDING_MINS,
+            end: timeToMins(a.timeWindow.end) + TRAVEL_PADDING_MINS
+          };
+        }).filter(Boolean) as {start: number, end: number}[];
+
+        // Sort busy intervals
+        busyIntervals.sort((a, b) => a.start - b.start);
+
+        // Merge overlapping busy intervals
+        const mergedBusy: {start: number, end: number}[] = [];
+        for (const interval of busyIntervals) {
+          if (mergedBusy.length === 0) {
+             mergedBusy.push(interval);
+          } else {
+             const last = mergedBusy[mergedBusy.length - 1];
+             if (interval.start <= last.end) {
+                last.end = Math.max(last.end, interval.end);
+             } else {
+                mergedBusy.push(interval);
+             }
+          }
+        }
+
+        // Test potential start times: flexBoundStart, and immediately after any busy block ends
+        const potentialStarts = [flexBoundStart, ...mergedBusy.map(b => b.end)];
+
+        for (const pStart of potentialStarts) {
+          const pEnd = pStart + flexDuration;
+          if (pStart >= flexBoundStart && pEnd <= flexBoundEnd) {
+             // Check against all merged busy intervals
+             const hasOverlap = mergedBusy.some(b => pStart < b.end && pEnd > b.start);
+             if (!hasOverlap) {
+                bestStart = pStart;
+                break;
+             }
+          }
+        }
+
+        if (bestStart !== -1) {
+          // Successfully placed
+          flex.timeWindow.start = formatTime(bestStart);
+          flex.timeWindow.end = formatTime(bestStart + flexDuration);
+        } else {
+          bestConflicts.push({
+             fromId: flex.id,
+             toId: flex.id,
+             travelTimeMins: 0,
+             availableGapMins: 0,
+             message: `Gagal Menjadwalkan: Jadwal flexibel "${flex.title}" tidak memiliki slot kosong yang cukup dalam rentang waktunya (termasuk jeda 15 menit).`,
+             type: 'FLEX_FAILED',
+             flexId: flex.id
+          });
+        }
+        scheduledActs.push(flex);
+      }
+
+      let optimizedSequence = scheduledActs.filter(a => a.timeWindow?.start).sort((a, b) => {
         const startA = timeToMins(a.timeWindow.start);
         const startB = timeToMins(b.timeWindow.start);
         
@@ -520,7 +602,7 @@ async function startServer() {
         }
       }
 
-      // 7. Render OSRM Route line for the continuous optimized sequence
+      // 7. Render Route line using Geoapify
       let coords: any[] = [];
       let alternativeOptions: any[] = [];
       let totalDurationMins = 0;
@@ -528,37 +610,27 @@ async function startServer() {
       if (optimizedSequence.length >= 2) {
         try {
           const coordsStr = optimizedSequence
-            .map((a: any) => `${a.location.longitude},${a.location.latitude}`)
-            .join(";");
-          const routeUrl = `https://router.project-osrm.org/route/v1/driving/${coordsStr}?overview=full&geometries=geojson&alternatives=true`;
-          const rResponse = await fetch(routeUrl);
-          const rData = await rResponse.json();
-
-          if (rData.code === "Ok" && rData.routes && rData.routes.length > 0) {
-            coords = rData.routes[0].geometry.coordinates.map((c: any[]) => [
-              c[1],
-              c[0],
-            ]);
-            totalDurationMins = Math.max(
-              1,
-              Math.round(rData.routes[0].duration / 60)
-            );
+            .map((a: any) => `${a.location.latitude},${a.location.longitude}`)
+            .join("|");
             
-            // Extract alternative routes
-            if (rData.routes.length > 1) {
-              for (let i = 1; i < rData.routes.length; i++) {
-                const alt = rData.routes[i];
-                alternativeOptions.push({
-                   id: i,
-                   coords: alt.geometry.coordinates.map((c: any[]) => [c[1], c[0]]),
-                   cost: Math.round(alt.duration / 60),
-                   timeStr: `${Math.round(alt.duration / 60)} min`
-                });
-              }
+          const apiKey = process.env.GEOAPIFY_API_KEY || "daab02fe82f54d7099d94b0ce9fcecb6";
+          const routeUrl = `https://api.geoapify.com/v1/routing?waypoints=${coordsStr}&mode=drive&apiKey=${apiKey}`;
+          const rResponse = await fetch(routeUrl);
+          if (!rResponse.ok) {
+            console.error("Geoapify API Error in get_route!");
+          } else {
+            const rData = await rResponse.json();
+
+            if (rData.features && rData.features.length > 0) {
+              let cl = rData.features[0].geometry.coordinates;
+              if (rData.features[0].geometry.type === "MultiLineString") cl = cl.flat(1);
+              coords = cl.map((c: any[]) => [c[1], c[0]]);
+              
+              totalDurationMins = rData.features[0].properties.time ? Math.max(1, Math.round(rData.features[0].properties.time / 60)) : 0;
             }
           }
         } catch (err) {
-          console.error("OSRM routing line generation failed", err);
+          console.error("Geoapify routing line generation failed", err);
         }
       }
 
@@ -570,43 +642,7 @@ async function startServer() {
         ]);
       }
 
-      // 8. Add real-time overdue warnings in Asia/Jakarta timezone
-      try {
-        const now = new Date();
-        const formatterDate = new Intl.DateTimeFormat("en-CA", {
-          timeZone: "Asia/Jakarta",
-          year: "numeric",
-          month: "2-digit",
-          day: "2-digit",
-        });
-        const todayJakartaStr = formatterDate.format(now);
-
-        const formatterTime = new Intl.DateTimeFormat("en-GB", {
-          timeZone: "Asia/Jakarta",
-          hour: "2-digit",
-          minute: "2-digit",
-          hour12: false,
-        });
-        const timeJakartaStr = formatterTime.format(now);
-        const nowMins = timeToMins(timeJakartaStr);
-
-        for (const act of optimizedSequence) {
-          if ((act.date === todayJakartaStr || act.isAlways) && act.type === "FIXED" && act.timeWindow?.start) {
-            const actMins = timeToMins(act.timeWindow.start);
-            if (actMins < nowMins) {
-              bestConflicts.push({
-                fromId: act.id,
-                toId: act.id,
-                travelTimeMins: 0,
-                availableGapMins: 0,
-                message: `Peringatan: Jadwal "${act.title}" telah terlewati atau sedang berlangsung jika menurut waktu saat ini (WIB: ${timeJakartaStr}).`
-              });
-            }
-          }
-        }
-      } catch (timezoneErr) {
-        console.error("Failed to append timezone conflicts", timezoneErr);
-      }
+      // 8. Past-schedule warnings have been intentionally removed by user config.
 
       res.json({
         options: [

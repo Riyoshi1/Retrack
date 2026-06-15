@@ -9,3 +9,12 @@ coverage/
 .vite/
 graphhopper/
 *.zip
+
+# Markdown files
+*.md
+!README.md
+
+# Backup files
+*.backup*
+*.bak
+* - Copy*

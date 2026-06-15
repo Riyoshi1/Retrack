@@ -21,14 +21,23 @@ import {
   GitCommit,
   Coffee,
   LogIn,
-  Bike
+  Bike,
+  Zap
 } from "lucide-react";
 import { Map as MapIcon } from "lucide-react";
 import { Activity } from "./types";
+import {
+  buildGraphFromActivities,
+  runDijkstra,
+  runBellmanFord,
+  runAStar,
+  runFloydWarshall,
+  ALGORITHMS_INFO
+} from "./lib/algorithms";
 import { MapContainer, TileLayer, Polyline, Marker, useMap, useMapEvents } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
-import { auth, signInWithGoogle, logout, requestNotificationPermissionAndGetToken, setupForegroundNotificationListener, saveActivityToDb, deleteActivityFromDb, fetchUserActivities } from "./lib/firebase";
+import { auth, signInWithGoogle, logout, requestNotificationPermissionAndGetToken, setupForegroundNotificationListener, saveActivityToDb, deleteActivityFromDb, updateActivityInDb, fetchUserActivities } from "./lib/firebase";
 import { onAuthStateChanged, User } from "firebase/auth";
 
 // Custom Leaflet marker builder supporting Welsh-Powell colors
@@ -42,12 +51,11 @@ const createNumberedIcon = (
   const bg = customColor ? customColor : defaultBg;
   const color = customColor || isSelected ? "white" : isDimmed ? "#94a3b8" : "#2563eb";
   const border = customColor ? "#FFFFFF" : isSelected ? "white" : isDimmed ? "#cbd5e1" : "#2563eb";
-  
+
   return L.divIcon({
     className: "custom-div-icon",
-    html: `<div style="background-color: ${bg}; color: ${color}; border-radius: 50%; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; font-weight: bold; border: 3px solid ${border}; box-shadow: 0 4px 10px rgba(0,0,0,0.3); font-size: 15px; font-family: sans-serif; transition: all 0.2s; ${
-      isDimmed ? "opacity: 0.7;" : ""
-    }">${num}</div>`,
+    html: `<div style="background-color: ${bg}; color: ${color}; border-radius: 50%; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; font-weight: bold; border: 3px solid ${border}; box-shadow: 0 4px 10px rgba(0,0,0,0.3); font-size: 15px; font-family: sans-serif; transition: all 0.2s; ${isDimmed ? "opacity: 0.7;" : ""
+      }">${num}</div>`,
     iconSize: [34, 34],
     iconAnchor: [17, 17],
   });
@@ -125,72 +133,175 @@ const MapEventsHandler = ({ onDoubleClick }: { onDoubleClick: (lat: number, lng:
 };
 
 // ============================================
-// WELSH-POWELL GRAPH COLORING ENGINE
+// CSP BACKTRACKING GRAPH COLORING (SCHEDULING)
 // ============================================
-function colorOverlapGraph(activities: Activity[]): Record<string, string> {
+function colorOverlapGraph(activities: Activity[], serverConflicts: any[]): Record<string, string> {
   const n = activities.length;
   if (n === 0) return {};
 
-  const adj: Record<string, string[]> = {};
-  activities.forEach((a) => {
-    adj[a.id] = [];
-  });
+  const colors: Record<string, string> = {};
+  const now = new Date();
+  const currentTotalMins = now.getHours() * 60 + now.getMinutes();
+  const currentDateStr = getTodayDateString();
 
-  const isOverlap = (a: Activity, b: Activity) => {
-    const aStart = timeToMins(a.timeWindow?.start);
-    const aEnd = timeToMins(a.timeWindow?.end);
-    const bStart = timeToMins(b.timeWindow?.start);
-    const bEnd = timeToMins(b.timeWindow?.end);
-    if (!aStart || !aEnd || !bStart || !bEnd) return false;
-    return aStart < bEnd && bStart < aEnd;
+  const isPassed = (a: Activity) => {
+    if (!a.date) return false;
+    if (a.date < currentDateStr) return true;
+    if (a.date === currentDateStr) {
+      const aEnd = timeToMins(a.timeWindow?.end);
+      if (aEnd !== 0 && currentTotalMins >= aEnd) return true;
+    }
+    return false;
   };
 
-  for (let i = 0; i < n; i++) {
-    for (let j = i + 1; j < n; j++) {
-      if (isOverlap(activities[i], activities[j])) {
-        adj[activities[i].id].push(activities[j].id);
-        adj[activities[j].id].push(activities[i].id);
-      }
-    }
-  }
+  // Build Adjacency List for Conflict Graph
+  const adj: Record<string, string[]> = {};
+  const activeIds: string[] = [];
 
-  const degrees: Record<string, number> = {};
-  activities.forEach((a) => {
-    degrees[a.id] = adj[a.id].length;
+  activities.forEach(a => {
+    adj[a.id] = [];
+    if (isPassed(a)) {
+      colors[a.id] = "#10B981"; // Hijau untuk yang sudah terlewati
+    } else {
+      activeIds.push(a.id);
+    }
   });
 
-  const sortedIds = [...activities]
-    .map((a) => a.id)
-    .sort((a, b) => degrees[b] - degrees[a]);
+  // Attach server conflicts as hard edges
+  serverConflicts.forEach(conf => {
+    if (conf.fromId && conf.toId) {
+      if (!adj[conf.fromId]?.includes(conf.toId)) adj[conf.fromId]?.push(conf.toId);
+      if (!adj[conf.toId]?.includes(conf.fromId)) adj[conf.toId]?.push(conf.fromId);
+    }
+  });
 
-  const colors: Record<string, string> = {};
-  const palette = ["#FF3B30", "#FF9500", "#FFCC00", "#FF2D55"]; // Overlap contrast warning colors
+  const getOverlapInterval = (aStart: number, aEnd: number, bStart: number, bEnd: number) => {
+    const s = Math.max(aStart, bStart);
+    const e = Math.min(aEnd, bEnd);
+    return s < e ? { start: s, end: e } : null;
+  };
 
-  let colorIdx = 0;
-  for (const id of sortedIds) {
-    if (colors[id] !== undefined) continue;
+  // 1. Identifikasi konflik jadwal (Edges lokal Graph)
+  activities.forEach(a => {
+    if (a.type !== "FLEXIBLE" || isPassed(a)) return;
+    const aStart = timeToMins(a.timeWindow?.start);
+    const aEnd = timeToMins(a.timeWindow?.end);
+    if (!aStart || !aEnd) return;
+    const duration = a.durationMinutes || 30;
 
-    // Only assign colored warning if the node has at least 1 conflict overlap
-    const assignedColor = degrees[id] > 0 ? palette[colorIdx % palette.length] : "";
-    colors[id] = assignedColor;
+    let freeIntervals = [{ start: aStart, end: aEnd }];
+    const conflictingFixedIds: string[] = [];
 
-    for (const otherId of sortedIds) {
-      if (otherId === id || colors[otherId] !== undefined) continue;
+    activities.forEach(b => {
+      if (b.type !== "FIXED" || isPassed(b) || b.id === a.id) return;
+      const bStart = timeToMins(b.timeWindow?.start);
+      const bEnd = timeToMins(b.timeWindow?.end);
+      if (!bStart || !bEnd) return;
 
-      let isAdjacentToColored = false;
-      for (const colId of sortedIds) {
-        if (colors[colId] === assignedColor && adj[otherId].includes(colId)) {
-          isAdjacentToColored = true;
-          break;
+      const overlap = getOverlapInterval(aStart, aEnd, bStart, bEnd);
+      if (overlap) {
+        conflictingFixedIds.push(b.id);
+        const newFree: { start: number, end: number }[] = [];
+        freeIntervals.forEach(iv => {
+          const ov = getOverlapInterval(iv.start, iv.end, bStart, bEnd);
+          if (ov) {
+            if (iv.start < ov.start) newFree.push({ start: iv.start, end: ov.start });
+            if (ov.end < iv.end) newFree.push({ start: ov.end, end: iv.end });
+          } else {
+            newFree.push(iv);
+          }
+        });
+        freeIntervals = newFree;
+      }
+    });
+
+    const maxFree = freeIntervals.reduce((max, iv) => Math.max(max, iv.end - iv.start), 0);
+    if (maxFree < duration) {
+      // FLEXIBLE task ini tidak dapat dijadwalkan tanpa bertumpuk! (Hard Constraint failed)
+      conflictingFixedIds.forEach(bId => {
+        if (!adj[a.id]?.includes(bId)) {
+          adj[a.id]?.push(bId);
+          adj[bId]?.push(a.id);
+        }
+      });
+    }
+  });
+
+  // 2. FIXED vs FIXED conflicts & FLEXIBLE vs FLEXIBLE conflicts
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const a = activities[i];
+      const b = activities[j];
+      if (isPassed(a) || isPassed(b)) continue;
+
+      const aStart = timeToMins(a.timeWindow?.start);
+      const aEnd = timeToMins(a.timeWindow?.end);
+      const bStart = timeToMins(b.timeWindow?.start);
+      const bEnd = timeToMins(b.timeWindow?.end);
+      if (!aStart || !aEnd || !bStart || !bEnd) continue;
+
+      if (aStart < bEnd && bStart < aEnd) {
+        if (a.type === "FIXED" && b.type === "FIXED") {
+          if (!adj[a.id]?.includes(b.id)) { adj[a.id]?.push(b.id); adj[b.id]?.push(a.id); }
+        } else if (a.type === "FLEXIBLE" && b.type === "FLEXIBLE") {
+          if (!adj[a.id]?.includes(b.id)) { adj[a.id]?.push(b.id); adj[b.id]?.push(a.id); }
         }
       }
+    }
+  }
 
-      if (!isAdjacentToColored) {
-        colors[otherId] = degrees[otherId] > 0 ? assignedColor : "";
+  // 3. BACKTRACKING CSP MAP COLORING ENGINE
+  const palette = ["#EF4444", "#F97316", "#EAB308", "#FF2D55"]; // Warna peringatan (Merah, Oranye, Kuning, Merah Muda Terang)
+
+  // Hanya warnai node (aktivitas) yang memiliki konflik (vektor > 0)
+  const nodesToColor = activeIds.filter(id => adj[id].length > 0);
+  const colorAssignment: Record<string, string> = {};
+
+  // MRV (Minimum Remaining Values) / Degree Heuristic: Urutkan node dengan edge (konflik) paling banyak
+  nodesToColor.sort((a, b) => adj[b].length - adj[a].length);
+
+  const isColourSafeForNode = (nodeId: string, color: string, assignment: Record<string, string>) => {
+    for (const neighbor of adj[nodeId]) {
+      if (assignment[neighbor] === color) return false;
+    }
+    return true;
+  };
+
+  const cspBacktrack = (index: number, assignment: Record<string, string>): boolean => {
+    if (index === nodesToColor.length) {
+      return true; // Semua node konflik berhasil diberikan warna berbeda
+    }
+    const nodeId = nodesToColor[index];
+    for (const color of palette) {
+      if (isColourSafeForNode(nodeId, color, assignment)) {
+        assignment[nodeId] = color;
+        if (cspBacktrack(index + 1, assignment)) {
+          return true;
+        }
+        delete assignment[nodeId]; // Backtrack, coba warna lain
       }
     }
-    colorIdx++;
+    return false; // Backtrack ke tree sebelumnya
+  };
+
+  if (nodesToColor.length > 0) {
+    const success = cspBacktrack(0, colorAssignment);
+    if (!success) {
+      // Jika palette habis (graf terlalu rapat / warna kurang), tetapkan fallback serakah
+      nodesToColor.forEach(id => {
+        if (!colorAssignment[id]) colorAssignment[id] = palette[0];
+      });
+    }
   }
+
+  // Assign warna final ke return map
+  activeIds.forEach(id => {
+    if (colorAssignment[id]) {
+      colors[id] = colorAssignment[id];
+    } else {
+      colors[id] = ""; // Kosong = Tanpa konflik (Aman)
+    }
+  });
 
   return colors;
 }
@@ -215,7 +326,95 @@ const MapCanvas = ({
   const [manualSequenceIds, setManualSequenceIds] = useState<string[]>([]);
   const [manualRouteCoords, setManualRouteCoords] = useState<any[]>([]);
 
-  // Simulasi State
+  // States untuk Kustom Algoritma Graf
+  const [showGraphHUD, setShowGraphHUD] = useState(false);
+  const [isGraphActive, setIsGraphActive] = useState(false);
+  const [selectedAlgo, setSelectedAlgo] = useState<"dijkstra" | "bellman_ford" | "a_star" | "floyd_warshall">("dijkstra");
+  const [graphStartNodeId, setGraphStartNodeId] = useState<string>("");
+  const [graphGoalNodeId, setGraphGoalNodeId] = useState<string>("");
+  const [showGraphNetwork, setShowGraphNetwork] = useState(true);
+  const [isAdvantagesModalOpen, setIsAdvantagesModalOpen] = useState(false);
+  const [algoRouteCoords, setAlgoRouteCoords] = useState<[number, number][]>([]);
+
+  // Mengisi Start & Goal Node secara otomatis saat todaysActivities terisi
+  useEffect(() => {
+    if (todaysActivities.length >= 2) {
+      if (!graphStartNodeId || !todaysActivities.some(a => a.id === graphStartNodeId)) {
+        setGraphStartNodeId(todaysActivities[0].id);
+      }
+      if (!graphGoalNodeId || !todaysActivities.some(a => a.id === graphGoalNodeId)) {
+        setGraphGoalNodeId(todaysActivities[todaysActivities.length - 1].id);
+      }
+    }
+  }, [todaysActivities, graphStartNodeId, graphGoalNodeId]);
+
+  // Membangun data graf virtual dari kustom kegiatan
+  const [graphData, setGraphData] = useState<{ nodes: any[], edges: any[] }>({ nodes: [], edges: [] });
+
+  useEffect(() => {
+    let active = true;
+    const fetchGraph = async () => {
+      const data = await buildGraphFromActivities(todaysActivities);
+      if (active) {
+        setGraphData(data);
+      }
+    };
+    fetchGraph();
+    return () => { active = false; };
+  }, [todaysActivities]);
+
+  // Menjalankan algoritma pemecah graf terpilih secara dinamis
+  const pathfindingResult = React.useMemo(() => {
+    if (todaysActivities.length < 2 || !graphStartNodeId || !graphGoalNodeId || !isGraphActive) return null;
+    const { nodes, edges } = graphData;
+
+    if (selectedAlgo === "dijkstra") {
+      return runDijkstra(nodes, edges, graphStartNodeId, graphGoalNodeId);
+    } else if (selectedAlgo === "bellman_ford") {
+      return runBellmanFord(nodes, edges, graphStartNodeId, graphGoalNodeId);
+    } else if (selectedAlgo === "a_star") {
+      return runAStar(nodes, edges, graphStartNodeId, graphGoalNodeId);
+    } else if (selectedAlgo === "floyd_warshall") {
+      return runFloydWarshall(nodes, edges, graphStartNodeId, graphGoalNodeId);
+    }
+    return null;
+  }, [isGraphActive, graphData, selectedAlgo, graphStartNodeId, graphGoalNodeId]);
+
+  // Construct rute algoritma berdasarkan cached geometry dari GraphEdge
+  useEffect(() => {
+    if (isGraphActive && pathfindingResult && pathfindingResult.pathEdges.length > 0) {
+      const combinedCoords: [number, number][] = [];
+
+      for (const edge of pathfindingResult.pathEdges) {
+        if (edge.geometry && edge.geometry.length > 0) {
+          combinedCoords.push(...edge.geometry);
+        } else {
+          // Fallback if no geometry
+          combinedCoords.push([edge.fromNode.lat, edge.fromNode.lng]);
+          combinedCoords.push([edge.toNode.lat, edge.toNode.lng]);
+        }
+      }
+
+      setAlgoRouteCoords(combinedCoords);
+    } else {
+      setAlgoRouteCoords([]);
+    }
+  }, [isGraphActive, pathfindingResult]);
+
+  const activeSimulationSequence = React.useMemo(() => {
+    if (isGraphActive && pathfindingResult && pathfindingResult.path.length >= 2) {
+      return pathfindingResult.path
+        .map((n) => todaysActivities.find((a) => a.id === n.id))
+        .filter(Boolean) as Activity[];
+    }
+    if (isManualMode && manualSequenceIds.length > 0) {
+      return manualSequenceIds
+        .map((id) => todaysActivities.find((a) => a.id === id))
+        .filter(Boolean) as Activity[];
+    }
+    return todaysActivities;
+  }, [isGraphActive, pathfindingResult, isManualMode, manualSequenceIds, todaysActivities]);
+
   const [simulation, setSimulation] = useState<{
     isActive: boolean;
     coords: [number, number][];
@@ -246,29 +445,29 @@ const MapCanvas = ({
   };
 
   const startSimulation = async (targetActivityOrIndex?: Activity | number, startFromLocation?: { lat: number; lng: number }) => {
-    if (todaysActivities.length === 0) {
-      alert("Tidak ada jadwal untuk hari ini.");
+    if (activeSimulationSequence.length === 0) {
+      alert("Tidak ada jadwal yang aktif untuk disimulasikan.");
       return;
     }
-    
+
     let targetIndex = 0;
     if (typeof targetActivityOrIndex === 'number') {
       targetIndex = targetActivityOrIndex;
-      if (targetIndex >= todaysActivities.length) {
+      if (targetIndex >= activeSimulationSequence.length) {
         alert("Semua kegiatan selesai!");
         setSimulation(prev => prev ? { ...prev, isActive: false, event: "Semua kegiatan selesai! 🎉" } : null);
         return;
       }
     } else if (targetActivityOrIndex) {
-      targetIndex = todaysActivities.findIndex(a => a.id === targetActivityOrIndex.id);
+      targetIndex = activeSimulationSequence.findIndex(a => a.id === targetActivityOrIndex.id);
       if (targetIndex === -1) targetIndex = 0;
     }
 
-    const act = todaysActivities[targetIndex];
+    const act = activeSimulationSequence[targetIndex];
     if (!act) return;
 
     const target = act.location;
-    
+
     let startLat: number, startLng: number;
     if (startFromLocation) {
       startLat = startFromLocation.lat;
@@ -284,53 +483,77 @@ const MapCanvas = ({
     const newObstacles = generateInitialObstacles(startLat, startLng, target.latitude, target.longitude);
     const existingObstacles = simulation?.obstacles || [];
     const allObstacles = [...existingObstacles, ...newObstacles];
+    const apiKey = import.meta.env.VITE_GEOAPIFY_API_KEY;
     const avoidStr = allObstacles.map(o => `location:${o.lat},${o.lng}`).join('|');
-    const waypointsStr = `${startLat},${startLng}|${target.latitude},${target.longitude}`;
 
     try {
-      // Parallel fetch via server proxy: AI best route (avoiding obstacles) + naive route (for rejected comparison)
-      const [bestRes, naiveRes] = await Promise.all([
-        fetch("/api/geoapify-route", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ waypoints: waypointsStr, mode: "drive", avoid: avoidStr })
-        }),
-        fetch("/api/geoapify-route", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ waypoints: waypointsStr, mode: "drive" })
-        })
-      ]);
-      const [bestData, naiveData] = await Promise.all([bestRes.json(), naiveRes.json()]);
-
-      // Process AI-selected best route (avoiding obstacles)
+      // Parallel fetch: AI best route & naive route fallback using Geoapify
       let bestCoords: [number, number][] = [];
-      if (bestData.features && bestData.features.length > 0) {
-        let cl = bestData.features[0].geometry.coordinates;
-        if (bestData.features[0].geometry.type === "MultiLineString") cl = cl.flat(1);
-        bestCoords = cl.map((c: any[]) => [c[1], c[0]] as [number, number]);
-      }
-
-      // Process naive/rejected route (without avoidance — for visualization)
       let rejectedRoutes: { coords: [number, number][]; reason: string }[] = [];
-      if (naiveData.features && naiveData.features.length > 0) {
-        let ncl = naiveData.features[0].geometry.coordinates;
-        if (naiveData.features[0].geometry.type === "MultiLineString") ncl = ncl.flat(1);
-        const naiveCoords = ncl.map((c: any[]) => [c[1], c[0]] as [number, number]);
-        const nearObs = newObstacles.filter(obs =>
-          naiveCoords.some((coord: [number, number]) => {
-            const d = Math.sqrt(Math.pow(coord[0] - obs.lat, 2) + Math.pow(coord[1] - obs.lng, 2));
-            return d < 0.01;
-          })
-        );
-        const reasons = nearObs.length > 0 ? nearObs.map(o => o.type).join(', ') : "Rute kurang optimal";
-        rejectedRoutes.push({ coords: naiveCoords, reason: reasons });
+
+      try {
+        const [bestRes, naiveRes] = await Promise.all([
+          fetch(`https://api.geoapify.com/v1/routing?waypoints=${startLat},${startLng}|${target.latitude},${target.longitude}&mode=drive&apiKey=${apiKey}${avoidStr ? `&avoid=${avoidStr}` : ''}`),
+          fetch(`https://api.geoapify.com/v1/routing?waypoints=${startLat},${startLng}|${target.latitude},${target.longitude}&mode=drive&apiKey=${apiKey}`)
+        ]);
+
+        if (!bestRes.ok || !naiveRes.ok) {
+          console.error("Geoapify API Error!");
+          setSimulation(prev => prev ? { ...prev, event: 'Error: API Geoapify Invalid!' } : null);
+        } else {
+          const [bestData, naiveData] = await Promise.all([bestRes.json(), naiveRes.json()]);
+
+          // Process AI-selected best route
+          if (bestData.features && bestData.features.length > 0) {
+            const geom = bestData.features[0].geometry;
+            if (geom.type === "MultiLineString") {
+              geom.coordinates.forEach((line: any[]) => {
+                bestCoords.push(...line.map((c: any[]) => [c[1], c[0]] as [number, number]));
+              });
+            } else if (geom.type === "LineString") {
+              bestCoords.push(...geom.coordinates.map((c: any[]) => [c[1], c[0]] as [number, number]));
+            }
+          }
+
+          // Process naive/rejected route
+          if (naiveData.features && naiveData.features.length > 0) {
+            let naiveCoords: [number, number][] = [];
+            const geom = naiveData.features[0].geometry;
+            if (geom.type === "MultiLineString") {
+              geom.coordinates.forEach((line: any[]) => {
+                naiveCoords.push(...line.map((c: any[]) => [c[1], c[0]] as [number, number]));
+              });
+            } else if (geom.type === "LineString") {
+              naiveCoords.push(...geom.coordinates.map((c: any[]) => [c[1], c[0]] as [number, number]));
+            }
+
+            const nearObs = newObstacles.filter(obs =>
+              naiveCoords.some((coord: [number, number]) => {
+                const d = Math.sqrt(Math.pow(coord[0] - obs.lat, 2) + Math.pow(coord[1] - obs.lng, 2));
+                return d < 0.01;
+              })
+            );
+            // Since we are using identical requests for Geoapify, we simulate the rejection reason, but the routes are the same.
+            // This ensures visualization continues functioning.
+            if (nearObs.length > 0) {
+              const reasons = nearObs.map(o => o.type).join(', ');
+              rejectedRoutes.push({ coords: naiveCoords, reason: reasons });
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Geoapify logic failed:", err);
       }
 
       // Fallback: if best route failed, use naive route as primary
       if (bestCoords.length === 0 && rejectedRoutes.length > 0) {
         bestCoords = rejectedRoutes[0].coords;
         rejectedRoutes = [];
+      }
+
+      // Final fallback to straight line
+      if (bestCoords.length === 0) {
+        bestCoords = [[startLat, startLng], [target.latitude, target.longitude]];
       }
 
       if (bestCoords.length > 0) {
@@ -357,19 +580,19 @@ const MapCanvas = ({
   };
 
   useEffect(() => {
-    if (!simulation || !simulation.isActive || simulation.event) return;
-    
+    if (!simulation || !simulation.isActive || simulation.event === "Tiba di tujuan! 🎉" || simulation.event === "Semua kegiatan selesai! 🎉") return;
+
     const interval = setInterval(() => {
       setSimulation(prev => {
-        if (!prev || !prev.isActive || prev.event) return prev;
-        
+        if (!prev || !prev.isActive || prev.event === "Tiba di tujuan! 🎉" || prev.event === "Semua kegiatan selesai! 🎉") return prev;
+
         let nextIndex = prev.currentIndex + 1;
         if (nextIndex >= prev.coords.length) {
-           return { ...prev, event: "Tiba di tujuan! 🎉" };
+          return { ...prev, event: "Tiba di tujuan! 🎉" };
         }
-        
+
         // Random chance of incident
-        if (nextIndex > 5 && nextIndex < prev.coords.length - 8 && Math.random() < 0.005) {
+        if (!prev.event && nextIndex > 5 && nextIndex < prev.coords.length - 8 && Math.random() < 0.005) {
           const events = [
             "🧠 Braess' Paradox: Kapasitas semu memicu macet (Agent Feedback)!",
             "🤖 Sensor Grid menemukan jalan buntu (D* Optimal Replanning)!",
@@ -383,101 +606,166 @@ const MapCanvas = ({
             event: randomEvent
           };
         }
-        
+
         return { ...prev, currentIndex: nextIndex };
       });
     }, 450); // Slightly slower speed for better visibility of real-time movement
-    
+
     return () => clearInterval(interval);
   }, [simulation?.isActive, simulation?.event]);
 
   useEffect(() => {
     // Arrival logic
     if (simulation?.event === "Tiba di tujuan! 🎉" && simulation.isActive) {
-       const timer = setTimeout(() => {
-           // Move to next activity
-           if (simulation.targetActivityIndex + 1 < todaysActivities.length) {
-              const currentLoc = simulation.coords[simulation.coords.length - 1];
-              startSimulation(simulation.targetActivityIndex + 1, { lat: currentLoc[0], lng: currentLoc[1] });
-           } else {
-              setSimulation(prev => prev ? { ...prev, isActive: false, event: "Semua kegiatan selesai! 🎉" } : null);
-           }
-       }, 3000);
-       return () => clearTimeout(timer);
+      const timer = setTimeout(() => {
+        // Move to next activity
+        if (simulation.targetActivityIndex + 1 < activeSimulationSequence.length) {
+          const currentLoc = simulation.coords[simulation.coords.length - 1];
+          startSimulation(simulation.targetActivityIndex + 1, { lat: currentLoc[0], lng: currentLoc[1] });
+        } else {
+          setSimulation(prev => prev ? { ...prev, isActive: false, event: "Semua kegiatan selesai! 🎉" } : null);
+        }
+      }, 3000);
+      return () => clearTimeout(timer);
     }
-  }, [simulation?.event, simulation?.isActive, simulation?.targetActivityIndex, todaysActivities]);
+  }, [simulation?.event, simulation?.isActive, simulation?.targetActivityIndex, activeSimulationSequence]);
 
   useEffect(() => {
     if (simulation?.event && simulation.event !== "Tiba di tujuan! 🎉" && simulation.event !== "Semua kegiatan selesai! 🎉" && simulation.isActive) {
-       const timer = setTimeout(async () => {
-         const currentLoc = simulation.coords[simulation.currentIndex] || simulation.coords[0] || [0, 0];
-         // Determine obstacle location: 15 steps ahead of the driver, or right before the destination
-         const obstacleIdx = Math.min(simulation.currentIndex + 15, Math.max(0, simulation.coords.length - 2));
-         const obstacleLoc = simulation.coords[obstacleIdx] || currentLoc;
-         const evtMessage = simulation.event;
-         const destLat = simulation.destLat;
-         const destLng = simulation.destLng;
+      let isCancelled = false;
+      
+      const doReplanning = async () => {
+        // Fetch immediately using the position at the time of the event
+        const startIdx = simulation.currentIndex;
+        const currentLoc = simulation.coords[startIdx] || simulation.coords[0] || [0, 0];
+        
+        // Determine obstacle location: 15 steps ahead of the driver
+        const obstacleIdx = Math.min(startIdx + 15, Math.max(0, simulation.coords.length - 2));
+        const obstacleLoc = simulation.coords[obstacleIdx] || currentLoc;
+        const evtMessage = simulation.event;
+        const destLat = simulation.destLat;
+        const destLng = simulation.destLng;
 
-         try {
-           const obstacleLat = obstacleLoc[0];
-           const obstacleLng = obstacleLoc[1];
+        try {
+          const apiKey = import.meta.env.VITE_GEOAPIFY_API_KEY;
+          const obstacleLat = obstacleLoc[0];
+          const obstacleLng = obstacleLoc[1];
 
-           // Build cumulative avoid from ALL obstacles + new one (ban semua jalur error sebelumnya)
-           const newObstacle = { lat: obstacleLat, lng: obstacleLng, type: evtMessage || "Obstacle" };
-           const allObstacles = [...simulation.obstacles, newObstacle];
-           const avoidStr = allObstacles.map(o => `location:${o.lat},${o.lng}`).join('|');
-           const waypointsStr = `${currentLoc[0]},${currentLoc[1]}|${destLat},${destLng}`;
-           
-           const res = await fetch("/api/geoapify-route", {
-             method: "POST",
-             headers: { "Content-Type": "application/json" },
-             body: JSON.stringify({ waypoints: waypointsStr, mode: "drive", avoid: avoidStr })
-           });
-           const data = await res.json();
-           
-           if (data.features && data.features.length > 0) {
-              let coordsList = data.features[0].geometry.coordinates;
-              if (data.features[0].geometry.type === "MultiLineString") {
-                coordsList = coordsList.flat(1);
+          // Ban all past obstacles + new one
+          const newObstacle = { lat: obstacleLat, lng: obstacleLng, type: evtMessage || "Obstacle" };
+          const allObstacles = [...simulation.obstacles, newObstacle];
+          const avoidStr = allObstacles.map(o => `location:${o.lat},${o.lng}`).join('|');
+
+          let newCoords: [number, number][] = [];
+          try {
+            const url = `https://api.geoapify.com/v1/routing?waypoints=${currentLoc[0]},${currentLoc[1]}|${destLat},${destLng}&mode=drive&apiKey=${apiKey}&avoid=${avoidStr}`;
+            const fetchPromise = fetch(url);
+            
+            // Wait for both the fetch and a 2.5s minimum display time for the popup
+            const [res] = await Promise.all([
+              fetchPromise,
+              new Promise(resolve => setTimeout(resolve, 2500))
+            ]);
+
+            if (isCancelled) return;
+
+            if (!res.ok) {
+              console.error("Geoapify API Error in replanning!");
+              setSimulation(prev => prev ? { ...prev, event: 'Error: API Geoapify Invalid!' } : null);
+            } else {
+              const data = await res.json();
+
+              if (data.features && data.features.length > 0) {
+                const geom = data.features[0].geometry;
+                if (geom.type === "MultiLineString") {
+                  geom.coordinates.forEach((line: any[]) => {
+                    newCoords.push(...line.map((c: any[]) => [c[1], c[0]] as [number, number]));
+                  });
+                } else if (geom.type === "LineString") {
+                  newCoords.push(...geom.coordinates.map((c: any[]) => [c[1], c[0]] as [number, number]));
+                }
+              } else {
+                newCoords = [[currentLoc[0], currentLoc[1]], [destLat, destLng]];
               }
-              const newCoords = coordsList.map((c: any[]) => [c[1], c[0]]);
-              setSimulation(prev => {
-                if (!prev) return null;
-                return {
-                  ...prev,
-                  coords: newCoords,
-                  currentIndex: 0,
-                  event: null,
-                  obstacles: allObstacles
-                };
-              });
-           } else {
-             // Fallback: use fewer obstacles if too many cause routing failure
-             const recentAvoidStr = allObstacles.slice(-5).map(o => `location:${o.lat},${o.lng}`).join('|');
-             const fbRes = await fetch("/api/geoapify-route", {
-               method: "POST",
-               headers: { "Content-Type": "application/json" },
-               body: JSON.stringify({ waypoints: waypointsStr, mode: "drive", avoid: recentAvoidStr })
-             });
-             const fbData = await fbRes.json();
-             if (fbData.features && fbData.features.length > 0) {
-               let fbCoordsList = fbData.features[0].geometry.coordinates;
-               if (fbData.features[0].geometry.type === "MultiLineString") {
-                 fbCoordsList = fbCoordsList.flat(1);
-               }
-               const newCoords = fbCoordsList.map((c: any[]) => [c[1], c[0]]);
-               setSimulation(prev => prev ? { ...prev, coords: newCoords, currentIndex: 0, event: null, obstacles: allObstacles } : null);
-             } else {
-               setSimulation(prev => prev ? { ...prev, event: null, obstacles: allObstacles } : null);
-             }
-           }
-         } catch (e) {
-             setSimulation(prev => prev ? { ...prev, event: null } : null);
-         }
-       }, 3500);
-       return () => clearTimeout(timer);
+            }
+          } catch (apiErr) {
+            console.error("Geoapify replanning logic failed:", apiErr);
+          }
+
+          if (isCancelled) return;
+
+          if (newCoords.length === 0) {
+            newCoords = [currentLoc, [destLat, destLng]];
+          }
+
+          if (newCoords.length > 0) {
+            setSimulation(prev => {
+              if (!prev) return null;
+              
+              // The vehicle has kept moving. Find the closest point in newCoords to its live location
+              const liveLoc = prev.coords[prev.currentIndex];
+              let closestIndex = 0;
+              let minDistance = Infinity;
+              
+              for (let i = 0; i < newCoords.length; i++) {
+                const dx = newCoords[i][0] - liveLoc[0];
+                const dy = newCoords[i][1] - liveLoc[1];
+                const dist = dx * dx + dy * dy;
+                if (dist < minDistance) {
+                  minDistance = dist;
+                  closestIndex = i;
+                }
+              }
+
+              return {
+                ...prev,
+                coords: newCoords,
+                currentIndex: closestIndex,
+                event: null,
+                obstacles: allObstacles
+              };
+            });
+          } else {
+            setSimulation(prev => prev ? { ...prev, event: null, obstacles: allObstacles } : null);
+          }
+        } catch (e) {
+          if (!isCancelled) {
+            setSimulation(prev => prev ? { ...prev, event: null } : null);
+          }
+        }
+      };
+
+      doReplanning();
+
+      return () => {
+        isCancelled = true;
+      };
     }
   }, [simulation?.event, simulation?.isActive]);
+
+  const previousSequenceRef = useRef<string>("");
+  useEffect(() => {
+    const currentSeqMap = activeSimulationSequence.map(a => a.id).join(",");
+    if (previousSequenceRef.current && previousSequenceRef.current !== currentSeqMap) {
+      if (simulation && simulation.isActive && simulation.event !== "Semua kegiatan selesai! 🎉") {
+        let newIndex = activeSimulationSequence.findIndex(a => a.title === simulation.destName);
+        if (newIndex === -1 && activeSimulationSequence.length > 1) {
+          newIndex = 1;
+        } else if (newIndex === -1) {
+          newIndex = 0;
+        }
+        if (newIndex !== -1 && activeSimulationSequence[newIndex]) {
+          const currentLoc = simulation.coords[simulation.currentIndex] || simulation.coords[0] || [simulation.startLat, simulation.startLng];
+          setSimulation(prev => prev ? { ...prev, event: '📡 Transisi fungsi Graf algoritma berjalan...' } : null);
+
+          setTimeout(() => {
+            startSimulation(newIndex, { lat: currentLoc[0], lng: currentLoc[1] });
+          }, 1500);
+        }
+      }
+    }
+    previousSequenceRef.current = currentSeqMap;
+  }, [activeSimulationSequence]);
 
   const forceObstacle = () => {
     if (!simulation || !simulation.isActive || simulation.event) return;
@@ -510,7 +798,7 @@ const MapCanvas = ({
         const activeActs = manualSequenceIds
           .map((id) => todaysActivities.find((a) => a.id === id))
           .filter(Boolean) as Activity[];
-          
+
         try {
           const res = await fetch("/api/get_manual_route", {
             method: "POST",
@@ -527,7 +815,7 @@ const MapCanvas = ({
         } catch (e) {
           console.error("Manual route fetch error", e);
         }
-        
+
         // Fallback to straight lines
         setManualRouteCoords(activeActs.map((a) => [a.location.latitude, a.location.longitude]));
       } else {
@@ -561,13 +849,13 @@ const MapCanvas = ({
 
   const alternativeRoutesCoords = React.useMemo(() => {
     return routeOptions.slice(1).map(opt => {
-       const rawCoords = opt.coords;
-       if (typeof rawCoords === "string") {
-         return decodePolyline(rawCoords);
-       } else if (Array.isArray(rawCoords)) {
-         return rawCoords;
-       }
-       return [];
+      const rawCoords = opt.coords;
+      if (typeof rawCoords === "string") {
+        return decodePolyline(rawCoords);
+      } else if (Array.isArray(rawCoords)) {
+        return rawCoords;
+      }
+      return [];
     }).filter(coords => coords.length > 0);
   }, [routeOptions]);
 
@@ -605,7 +893,7 @@ const MapCanvas = ({
         {mapCoords.length > 0 && <AutoFitBounds coords={mapCoords} />}
 
         {/* Alternative Routes */}
-        {!isManualMode && !simulation?.isActive && alternativeRoutesCoords.map((coordsArr, i) => (
+        {!isManualMode && !simulation?.isActive && !isGraphActive && alternativeRoutesCoords.map((coordsArr, i) => (
           <Polyline
             key={`alt-route-${i}`}
             positions={coordsArr}
@@ -618,12 +906,61 @@ const MapCanvas = ({
         ))}
 
         {/* Chrono Sequence Line */}
-        {!isManualMode && !simulation?.isActive && processedRouteCoords.length > 0 && (
+        {!isManualMode && !simulation?.isActive && !isGraphActive && processedRouteCoords.length > 0 && (
           <Polyline
             positions={processedRouteCoords}
             color="#2563EB"
             weight={6}
             opacity={1}
+            lineCap="round"
+            lineJoin="round"
+          />
+        )}
+
+        {/* Graph Virtual Edges Network */}
+        {isGraphActive && showGraphNetwork && graphData.edges.map((edge, idx) => {
+          let edgeColor = "#9CA3AF";
+          let edgeDash = "1, 0";
+          let opacity = 0.25;
+
+          if (edge.type === "eco_bonus") {
+            edgeColor = "#10B981";
+            edgeDash = "4, 6";
+          } else if (edge.type === "traffic") {
+            edgeColor = "#EF4444";
+            edgeDash = "4, 6";
+          } else if (edge.type === "highway") {
+            edgeColor = "#3B82F6";
+            opacity = 0.35;
+          }
+
+          const positions = edge.geometry
+            ? edge.geometry
+            : [
+              [edge.fromNode.lat, edge.fromNode.lng] as [number, number],
+              [edge.toNode.lat, edge.toNode.lng] as [number, number]
+            ];
+
+          return (
+            <Polyline
+              key={`virtual-edge-${idx}`}
+              positions={positions}
+              color={edgeColor}
+              weight={1.5}
+              dashArray={edgeDash}
+              opacity={opacity}
+              lineCap="round"
+            />
+          );
+        })}
+
+        {/* Algorithm Solved Shortest Path */}
+        {isGraphActive && algoRouteCoords.length > 0 && (
+          <Polyline
+            positions={algoRouteCoords}
+            color="#8B5CF6"
+            weight={6}
+            opacity={0.95}
             lineCap="round"
             lineJoin="round"
           />
@@ -645,6 +982,8 @@ const MapCanvas = ({
         {todaysActivities.map((act, index) => {
           let displayNum = index + 1;
           let isSelected = false;
+          let isDimmed = false;
+          let customMarkerColor = overlapColors[act.id] || "";
 
           if (isManualMode) {
             const mIdx = manualSequenceIds.indexOf(act.id);
@@ -654,13 +993,27 @@ const MapCanvas = ({
             } else {
               displayNum = index + 1;
               isSelected = false;
+              isDimmed = true;
+            }
+          } else if (isGraphActive && pathfindingResult && pathfindingResult.path.length > 0) {
+            const pathNodeIndex = pathfindingResult.path.findIndex(n => n.id === act.id);
+            if (pathNodeIndex !== -1) {
+              displayNum = pathNodeIndex + 1;
+              isSelected = true;
+              if (act.id === graphStartNodeId) {
+                customMarkerColor = "#10B981"; // Emerald green for start node
+              } else if (act.id === graphGoalNodeId) {
+                customMarkerColor = "#EF4444"; // Red for goal node
+              } else {
+                customMarkerColor = "#8B5CF6"; // Purple for intermediate path
+              }
+            } else {
+              isSelected = false;
+              isDimmed = true;
             }
           } else {
             isSelected = true;
           }
-
-          const isDimmed = isManualMode && !isSelected;
-          const customMarkerColor = overlapColors[act.id] || ""; // Apply Welsh-Powell graph coloring
 
           return (
             <Marker
@@ -687,17 +1040,7 @@ const MapCanvas = ({
                   lineCap="round"
                   lineJoin="round"
                 />
-                {rejected.coords.length > 2 && (
-                  <Marker
-                    position={rejected.coords[Math.floor(rejected.coords.length * 0.35)]}
-                    icon={L.divIcon({
-                      className: "custom-div-icon",
-                      html: `<div style="background: linear-gradient(135deg, #dc2626, #b91c1c); color: white; padding: 4px 10px; border-radius: 10px; font-size: 9px; font-weight: 700; white-space: nowrap; box-shadow: 0 2px 10px rgba(220,38,38,0.4); border: 1.5px solid rgba(255,255,255,0.4);">❌ Ditolak AI: ${rejected.reason}</div>`,
-                      iconSize: [240, 30],
-                      iconAnchor: [120, 15],
-                    })}
-                  />
-                )}
+
               </React.Fragment>
             ))}
 
@@ -727,23 +1070,12 @@ const MapCanvas = ({
               lineCap="round"
               lineJoin="round"
             />
-            {/* AI Best Route Label */}
-            {simulation.rejectedRoutes && simulation.rejectedRoutes.length > 0 && simulation.coords.length > 2 && (
-              <Marker
-                position={simulation.coords[Math.floor(simulation.coords.length * 0.3)]}
-                icon={L.divIcon({
-                  className: "custom-div-icon",
-                  html: `<div style="background: linear-gradient(135deg, #059669, #047857); color: white; padding: 4px 10px; border-radius: 10px; font-size: 9px; font-weight: 700; white-space: nowrap; box-shadow: 0 2px 10px rgba(5,150,105,0.4); border: 1.5px solid rgba(255,255,255,0.4);">✅ Rute AI Terbaik</div>`,
-                  iconSize: [140, 30],
-                  iconAnchor: [70, 15],
-                })}
-              />
-            )}
+
             {simulation.currentIndex < simulation.coords.length && (
-               <Marker
-                 position={simulation.coords[simulation.currentIndex]}
-                 icon={simMotorIcon}
-               />
+              <Marker
+                position={simulation.coords[simulation.currentIndex]}
+                icon={simMotorIcon}
+              />
             )}
           </>
         )}
@@ -752,26 +1084,19 @@ const MapCanvas = ({
 
       {/* Simulation Event Alert */}
       {simulation?.event && (
-         <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 z-[2000] drop-shadow-xl pointer-events-none">
-            <div className={`px-6 py-4 rounded-xl ${isDarkMode ? "bg-slate-800 text-white" : "bg-white text-slate-800"} shadow-2xl flex flex-col items-center gap-2 border ${isDarkMode ? "border-slate-700" : "border-slate-200"}`}>
-               <span className="text-xl font-bold">{simulation.event}</span>
-               {simulation.event !== "Tiba di tujuan! 🎉" && simulation.event !== "Semua kegiatan selesai! 🎉" && (
-                 <span className="text-sm text-slate-500 flex items-center gap-2">
-                   <div className="w-4 h-4 border-2 border-t-blue-500 border-r-blue-500 border-b-transparent border-l-transparent rounded-full animate-spin"></div>
-                   Mencari rute alternatif...
-                 </span>
-               )}
-            </div>
-         </div>
+        <div className="absolute top-[120px] left-1/2 transform -translate-x-1/2 z-[2000] drop-shadow-xl pointer-events-none transition-all duration-300">
+          <div className={`px-5 py-3 rounded-2xl ${isDarkMode ? "bg-slate-800/95 text-white" : "bg-white/95 text-slate-800"} backdrop-blur-sm shadow-xl flex flex-col items-center gap-1 border ${isDarkMode ? "border-slate-700" : "border-slate-200"}`}>
+            <span className="text-sm font-extrabold tracking-wide">{simulation.event}</span>
+          </div>
+        </div>
       )}
 
       {/* Navigation Simulation HUD */}
       {simulation && simulation.isActive && (
-        <div className="absolute bottom-4 inset-x-4 z-[1000] pointer-events-none flex flex-col gap-2">
+        <div className="absolute bottom-10 inset-x-4 z-[1000] pointer-events-none flex flex-col gap-2">
           <div
-            className={`${
-              isDarkMode ? "bg-slate-900 border-slate-800 text-white" : "bg-white border-slate-200 text-slate-800"
-            } backdrop-blur-md rounded-2xl p-4 border pointer-events-auto shadow-2xl flex flex-col gap-3`}
+            className={`${isDarkMode ? "bg-slate-900 border-slate-800 text-white" : "bg-white border-slate-200 text-slate-800"
+              } backdrop-blur-md rounded-2xl p-4 border pointer-events-auto shadow-2xl flex flex-col gap-3`}
           >
             {/* Target Destination & Details */}
             <div className="flex items-center justify-between gap-1">
@@ -786,21 +1111,22 @@ const MapCanvas = ({
                   </p>
                 </div>
               </div>
-              
+
               {/* Dropdown list to change target activity */}
               <select
-                className={`text-[10px] font-bold p-1 rounded-lg border shrink-0 ${
-                  isDarkMode ? "bg-slate-800 border-slate-700 text-white" : "bg-slate-50 border-slate-200 text-slate-800"
-                }`}
-                value={todaysActivities.findIndex(a => a.title === simulation.destName)}
+                className={`text-[10px] font-bold p-1 rounded-lg border shrink-0 ${isDarkMode ? "bg-slate-800 border-slate-700 text-white" : "bg-slate-50 border-slate-200 text-slate-800"
+                  }`}
+                value={activeSimulationSequence.findIndex(a => a.title === simulation.destName)}
                 onChange={(e) => {
                   const index = Number(e.target.value);
-                  if (todaysActivities[index]) {
-                    startSimulation(todaysActivities[index]);
+                  if (activeSimulationSequence[index]) {
+                    // Update simulation from current loc
+                    const currentLoc = simulation.coords[simulation.currentIndex] || simulation.coords[0] || [simulation.startLat, simulation.startLng];
+                    startSimulation(activeSimulationSequence[index], { lat: currentLoc[0], lng: currentLoc[1] });
                   }
                 }}
               >
-                {todaysActivities.map((act, index) => (
+                {activeSimulationSequence.map((act, index) => (
                   <option key={act.id} value={index}>
                     Stop #{index + 1}: {act.title}
                   </option>
@@ -845,9 +1171,8 @@ const MapCanvas = ({
       {/* Overlays */}
       <div className="absolute top-6 inset-x-4 flex justify-between gap-4 items-start pointer-events-none z-[1000] drop-shadow-md">
         <div
-          className={`${
-            isDarkMode ? "bg-slate-900 text-white border-slate-800" : "bg-white/95 border-black/5"
-          } backdrop-blur-md pointer-events-auto border rounded-2xl px-4 py-3 flex items-center gap-3`}
+          className={`${isDarkMode ? "bg-slate-900 text-white border-slate-800" : "bg-white/95 border-black/5"
+            } backdrop-blur-md pointer-events-auto border rounded-2xl px-4 py-3 flex items-center gap-3`}
         >
           <div className="w-2.5 h-2.5 rounded-full bg-blue-600"></div>
           <div className="flex flex-col">
@@ -862,9 +1187,8 @@ const MapCanvas = ({
 
         {!isManualMode && routeOptions.length > 0 && (
           <div
-            className={`${
-              isDarkMode ? "bg-slate-900 text-white border-slate-800" : "bg-white/95 border-black/5"
-            } backdrop-blur-md pointer-events-auto border rounded-2xl px-4 py-3 flex items-center gap-2`}
+            className={`${isDarkMode ? "bg-slate-900 text-white border-slate-800" : "bg-white/95 border-black/5"
+              } backdrop-blur-md pointer-events-auto border rounded-2xl px-4 py-3 flex items-center gap-2`}
           >
             <div className="w-6 h-6 rounded-full bg-green-100 flex items-center justify-center shrink-0">
               <Clock className="w-3.5 h-3.5 text-green-600" strokeWidth={3} />
@@ -881,11 +1205,11 @@ const MapCanvas = ({
         )}
       </div>
 
-        <div className="absolute top-20 right-4 z-[1000] drop-shadow-md flex flex-col gap-3">
+      <div className="absolute top-[90px] right-4 z-[1000] drop-shadow-md flex flex-col gap-3 pointer-events-none">
+        {/* Toggle Manual Route */}
         <div
-          className={`${
-            isDarkMode ? "bg-slate-900 text-white border-slate-800" : "bg-white/95 border-black/5"
-          } backdrop-blur-md rounded-2xl px-4 py-3 flex items-center gap-3 border pointer-events-auto shadow-sm`}
+          className={`${isDarkMode ? "bg-slate-900 text-white border-slate-800" : "bg-white/95 border-black/5"
+            } backdrop-blur-md rounded-2xl px-4 py-3 flex items-center gap-3 border pointer-events-auto shadow-sm`}
         >
           <span className={`text-xs font-bold ${isDarkMode ? "text-white" : "text-slate-800"}`}>
             Manual Route
@@ -894,36 +1218,392 @@ const MapCanvas = ({
             onClick={() => {
               setIsManualMode(!isManualMode);
               setManualSequenceIds([]);
+              setIsGraphActive(false);
+              setSimulation(null);
             }}
-            className={`w-11 h-6 rounded-full flex items-center p-1 transition-colors focus:outline-none ${
-              isManualMode ? "bg-purple-600" : isDarkMode ? "bg-slate-600" : "bg-slate-300"
-            }`}
+            className={`w-11 h-6 rounded-full flex items-center p-1 transition-colors focus:outline-none ${isManualMode ? "bg-purple-600" : isDarkMode ? "bg-slate-600" : "bg-slate-300"
+              }`}
           >
             <div
-              className={`w-4 h-4 rounded-full bg-white transition-transform ${
-                isManualMode ? "translate-x-5" : "translate-x-0"
-              }`}
+              className={`w-4 h-4 rounded-full bg-white transition-transform ${isManualMode ? "translate-x-5" : "translate-x-0"
+                }`}
             ></div>
           </button>
         </div>
 
+        {/* Toggle Custom Graph Optimization */}
         <div
-          className={`${
-            isDarkMode ? "bg-slate-900 text-white border-slate-800" : "bg-white/95 border-black/5"
-          } backdrop-blur-md rounded-2xl px-4 py-3 flex items-center justify-between gap-3 border pointer-events-auto shadow-sm cursor-pointer hover:opacity-90`}
+          className={`${isDarkMode ? "bg-slate-900 text-white border-slate-800" : "bg-white/95 border-black/5"
+            } backdrop-blur-md rounded-2xl px-4 py-3 flex items-center justify-between gap-3 border pointer-events-auto shadow-sm cursor-pointer hover:opacity-90`}
           onClick={() => {
-             if (simulation) setSimulation(null);
-             else startSimulation();
+            setShowGraphHUD(!showGraphHUD);
           }}
         >
           <span className={`text-xs font-bold ${isDarkMode ? "text-white" : "text-slate-800"}`}>
-             Simulasi AI
+            Opsi Graf
+          </span>
+          <div
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsGraphActive(!isGraphActive);
+              if (!isGraphActive) {
+                setIsManualMode(false);
+                setSimulation(null);
+              }
+            }}
+            className={`px-2.5 py-1 rounded-full text-[10px] font-bold text-white transition-colors cursor-pointer hover:opacity-80 ${isGraphActive ? "bg-indigo-600 animate-pulse" : "bg-slate-500"}`}
+          >
+            {isGraphActive ? "AKTIF" : "OFF"}
+          </div>
+        </div>
+
+        {/* Toggle AI Simulation */}
+        <div
+          className={`${isDarkMode ? "bg-slate-900 text-white border-slate-800" : "bg-white/95 border-black/5"
+            } backdrop-blur-md rounded-2xl px-4 py-3 flex items-center justify-between gap-3 border pointer-events-auto shadow-sm cursor-pointer hover:opacity-90`}
+          onClick={() => {
+            if (simulation) {
+              setSimulation(null);
+            } else {
+              startSimulation();
+              setIsManualMode(false);
+              setIsGraphActive(false);
+            }
+          }}
+        >
+          <span className={`text-xs font-bold ${isDarkMode ? "text-white" : "text-slate-800"}`}>
+            Simulasi AI
           </span>
           <div className={`px-3 py-1 rounded-full text-[10px] font-bold text-white transition-colors ${simulation ? "bg-red-500" : "bg-blue-600"}`}>
-             {simulation ? "STOP" : "MULAI"}
+            {simulation ? "STOP" : "MULAI"}
           </div>
         </div>
       </div>
+
+      {/* FLOATING CONTROL HUD UNTUK ALGORITMA GRAF */}
+      {showGraphHUD && todaysActivities.length >= 2 && (
+        <div className="absolute bottom-[96px] inset-x-4 z-[1000] pointer-events-none flex flex-col gap-2">
+          <div
+            className={`${isDarkMode ? "bg-slate-900 border-slate-800 text-white" : "bg-white border-slate-200 text-slate-800"
+              } backdrop-blur-md rounded-2xl p-4 border pointer-events-auto shadow-2xl flex flex-col gap-3 max-h-[380px] overflow-y-auto no-scrollbar`}
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between border-b pb-2 border-slate-200 dark:border-slate-800">
+              <div className="flex items-center gap-2">
+                <Compass className="w-4 h-4 text-indigo-500 animate-spin" style={{ animationDuration: '6s' }} />
+                <h4 className="text-xs font-extrabold tracking-tight">Graph Algorithm Solver</h4>
+              </div>
+              <button
+                onClick={() => setShowGraphHUD(false)}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Algorithm Select & Info Button */}
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-[8px] font-bold text-slate-400 mb-1 uppercase tracking-wider">
+                  Algoritma Pemilih
+                </label>
+                <select
+                  value={selectedAlgo}
+                  onChange={(e) => setSelectedAlgo(e.target.value as any)}
+                  className={`w-full text-xs font-bold p-2 rounded-xl border focus:outline-none focus:ring-1 focus:ring-indigo-500 ${isDarkMode ? "bg-slate-800 border-slate-700 text-white" : "bg-slate-100 border-slate-200 text-slate-800"
+                    }`}
+                >
+                  <option value="dijkstra">Dijkstra (Klasik)</option>
+                  <option value="bellman_ford">Bellman-Ford</option>
+                  <option value="a_star">A* Heuristik</option>
+                  <option value="floyd_warshall">Floyd-Warshall</option>
+                </select>
+              </div>
+
+              <div className="flex items-end">
+                <button
+                  type="button"
+                  onClick={() => setIsAdvantagesModalOpen(true)}
+                  className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-[10px] text-white font-extrabold rounded-xl shadow-md flex items-center justify-center gap-1 transition-colors uppercase tracking-wider cursor-pointer active:scale-95"
+                >
+                  <Info className="w-3.5 h-3.5" /> Kelebihan Algo
+                </button>
+              </div>
+            </div>
+
+            {/* Start and Goal Selectors */}
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-[8px] font-bold text-slate-400 mb-1 uppercase tracking-wider">
+                  Mulai Dari (Start)
+                </label>
+                <select
+                  value={graphStartNodeId}
+                  onChange={(e) => setGraphStartNodeId(e.target.value)}
+                  className={`w-full text-xs font-semibold p-2 rounded-xl border focus:outline-none ${isDarkMode ? "bg-slate-800 border-slate-700 text-white" : "bg-slate-100 border-slate-200 text-slate-800"
+                    }`}
+                >
+                  {todaysActivities.map((act, index) => (
+                    <option key={act.id} value={act.id}>
+                      Stop #{index + 1}: {act.title}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-[8px] font-bold text-slate-400 mb-1 uppercase tracking-wider">
+                  Tujuan Akhir (Goal)
+                </label>
+                <select
+                  value={graphGoalNodeId}
+                  onChange={(e) => setGraphGoalNodeId(e.target.value)}
+                  className={`w-full text-xs font-semibold p-2 rounded-xl border focus:outline-none ${isDarkMode ? "bg-slate-800 border-slate-700 text-white" : "bg-slate-100 border-slate-200 text-slate-800"
+                    }`}
+                >
+                  {todaysActivities.map((act, index) => (
+                    <option key={act.id} value={act.id}>
+                      Stop #{index + 1}: {act.title}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {/* Performance Statistics HUD */}
+            {pathfindingResult && (
+              <div className={`p-4 rounded-2xl border transition-all ${isDarkMode
+                ? "bg-slate-950/90 border-slate-800 shadow-xl"
+                : "bg-white border-slate-100 shadow-sm"
+                } text-[11px] space-y-3.5`}>
+                <div className="flex justify-between items-center border-b pb-2 border-slate-100 dark:border-slate-850">
+                  <span className="flex items-center gap-1.5 text-[10px] uppercase font-black text-slate-500 dark:text-slate-400 tracking-wider">
+                    <Zap className="w-3.5 h-3.5 text-indigo-500 animate-pulse shrink-0" />
+                    Metrik Kinerja Solver
+                  </span>
+                  <span className="text-emerald-700 dark:text-emerald-450 font-mono text-[8px] bg-emerald-500/10 dark:bg-emerald-500/15 px-2 py-0.5 rounded-full font-black flex items-center gap-1 shrink-0 uppercase tracking-widest">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping inline-block" />
+                    Active Solver
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2 font-mono">
+                  {/* WAKTU SOLVER (UTAMA & SANGAT JELAS) */}
+                  <div className={`p-2.5 rounded-xl border flex flex-col items-center justify-center transition-all ${isDarkMode
+                    ? "bg-indigo-950/30 border-indigo-500/30 shadow-[0_0_12px_rgba(99,102,241,0.12)]"
+                    : "bg-indigo-50 border-indigo-200/80 shadow-xs"
+                    }`}>
+                    <div className="flex items-center gap-1 text-[8px] sm:text-[9px] uppercase font-black tracking-wider text-indigo-600 dark:text-indigo-300">
+                      <Clock className="w-3.5 h-3.5 text-indigo-500 animate-spin" style={{ animationDuration: "12s" }} />
+                      WAKTU CPU
+                    </div>
+                    <div className={`text-[14px] sm:text-[16px] font-black tracking-tight mt-1 ${isDarkMode ? "text-indigo-200" : "text-indigo-900"
+                      }`}>
+                      {pathfindingResult.executionTimeMs < 1
+                        ? `${(pathfindingResult.executionTimeMs * 1000).toFixed(0)} μs`
+                        : `${pathfindingResult.executionTimeMs.toFixed(2)} ms`
+                      }
+                    </div>
+                    <div className="text-[7px] sm:text-[7.5px] mt-0.5 uppercase font-bold text-slate-400 dark:text-slate-500 tracking-widest text-center">
+                      Durasi Solusi
+                    </div>
+                  </div>
+
+                  {/* NODE DICEK */}
+                  <div className={`p-2.5 rounded-xl border flex flex-col items-center justify-center ${isDarkMode ? "bg-slate-900 border-slate-800" : "bg-slate-50 border-slate-200"
+                    }`}>
+                    <div className="flex items-center gap-1 text-[8px] sm:text-[9px] uppercase font-bold text-slate-500 dark:text-slate-400 tracking-wider">
+                      <GitCommit className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                      NODE DICEK
+                    </div>
+                    <div className="text-[14px] sm:text-[16px] font-black tracking-tight text-amber-650 dark:text-amber-400 mt-1">
+                      {pathfindingResult.exploredNodesCount}
+                    </div>
+                    <div className="text-[7px] sm:text-[7.5px] mt-0.5 uppercase font-bold text-slate-400 dark:text-slate-500 tracking-widest text-center">
+                      Komputasi Graf
+                    </div>
+                  </div>
+
+                  {/* FISIK DISTANCE */}
+                  <div className={`p-2.5 rounded-xl border flex flex-col items-center justify-center ${isDarkMode ? "bg-slate-900 border-slate-800" : "bg-slate-50 border-slate-200"
+                    }`}>
+                    <div className="flex items-center gap-1 text-[8px] sm:text-[9px] uppercase font-bold text-slate-500 dark:text-slate-400 tracking-wider">
+                      <Compass className="w-3.5 h-3.5 text-emerald-500 shrink-0" />
+                      FISIK (KM)
+                    </div>
+                    <div className="text-[14px] sm:text-[16px] font-black tracking-tight text-emerald-600 dark:text-emerald-400 mt-1">
+                      {pathfindingResult.totalDistanceKm.toFixed(2)} <span className="text-[9px] font-bold">km</span>
+                    </div>
+                    <div className="text-[7px] sm:text-[7.5px] mt-0.5 uppercase font-bold text-slate-400 dark:text-slate-500 tracking-widest text-center">
+                      Jarak Tempuh
+                    </div>
+                  </div>
+                </div>
+
+                {pathfindingResult.errorMessage ? (
+                  <div className="p-2.5 rounded-xl bg-amber-50 dark:bg-amber-950/40 text-[9.5px] text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-900/65 font-bold leading-relaxed">
+                    ⚠️ {pathfindingResult.errorMessage}
+                  </div>
+                ) : (
+                  <div className={`p-3 rounded-xl border flex flex-col gap-1.5 leading-tight text-left ${isDarkMode ? "bg-slate-900/40 border-slate-800/80" : "bg-indigo-50/20 border-indigo-100"
+                    }`}>
+                    <span className="font-extrabold text-slate-400 dark:text-slate-500 text-[8px] uppercase tracking-wider">Hasil Urutan Rute:</span>
+                    <span className="font-black text-indigo-600 px-1 dark:text-indigo-400 text-[11px] flex flex-wrap items-center gap-1">
+                      {pathfindingResult.path.map((node, idx) => (
+                        <React.Fragment key={node.id}>
+                          {idx > 0 && <span className="text-slate-300 dark:text-slate-700 font-normal">➔</span>}
+                          <span className="bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-200 px-1.5 py-0.5 rounded-md text-[9px] font-black shrink-0 shadow-3xs">
+                            {node.name}
+                          </span>
+                        </React.Fragment>
+                      ))}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Toggle Network Layout */}
+            <div className="flex items-center justify-between">
+              <span className="text-[9px] font-extrabold text-slate-500 dark:text-slate-400 uppercase tracking-widest flex items-center gap-1.5">
+                <GitCommit className="w-3.5 h-3.5 text-indigo-400" /> Tampilkan Jaringan Graf
+              </span>
+              <button
+                onClick={() => setShowGraphNetwork(!showGraphNetwork)}
+                className={`w-9 h-5 rounded-full flex items-center p-0.5 transition-colors focus:outline-none ${showGraphNetwork ? "bg-indigo-600" : isDarkMode ? "bg-slate-700" : "bg-slate-300"
+                  }`}
+              >
+                <div
+                  className={`w-4 h-4 rounded-full bg-white transition-transform ${showGraphNetwork ? "translate-x-4" : "translate-x-0"
+                    }`}
+                ></div>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* POPUP KELEBIHAN DAN KARAKTERISTIK ALGORITMA */}
+      {isAdvantagesModalOpen && (
+        <div className="absolute inset-0 z-[5000] flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-[2px] text-left">
+          <div
+            className={`${isDarkMode ? "bg-slate-900 border-slate-800 text-white" : "bg-white border-slate-200 text-slate-800"
+              } border rounded-[24px] p-5 w-full max-w-xs shadow-2xl relative max-h-[80vh] flex flex-col`}
+          >
+            {/* Close Button */}
+            <button
+              onClick={() => setIsAdvantagesModalOpen(false)}
+              className="absolute top-5 right-5 text-slate-400 hover:text-slate-900 dark:hover:text-white"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            {/* Title */}
+            <div className="flex items-center gap-2.5 mb-4 shrink-0 border-b pb-3 border-slate-200 dark:border-slate-800">
+              <div className="w-9 h-9 rounded-full bg-indigo-500/10 text-indigo-500 flex items-center justify-center shrink-0">
+                <Sparkles className="w-5 h-5 animate-pulse" />
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-md font-extrabold tracking-tight leading-none text-slate-800 dark:text-white">
+                  Kelebihan & Info
+                </h3>
+                <span className="text-[9px] uppercase font-bold tracking-widest text-indigo-500 font-mono">
+                  {selectedAlgo === "dijkstra" ? "Dijkstra" : selectedAlgo === "bellman_ford" ? "Bellman-Ford" : selectedAlgo === "a_star" ? "A* Search" : "Floyd-Warshall"}
+                </span>
+              </div>
+            </div>
+
+            {/* Content info */}
+            <div className="flex-1 overflow-y-auto pr-1 space-y-4 pb-3 text-xs">
+              {/* Creator & Complexity */}
+              <div className="grid grid-cols-2 gap-2">
+                <div className={`p-2 rounded-xl ${isDarkMode ? "bg-slate-800" : "bg-slate-50"} border border-slate-100 dark:border-slate-700`}>
+                  <div className="text-[8px] text-slate-400 font-bold uppercase tracking-wider">Penemu / Tahun</div>
+                  <div className="font-extrabold text-slate-700 dark:text-slate-200 mt-0.5 text-[10px] truncate">
+                    {selectedAlgo === "dijkstra" ? "Edsger Dijkstra" : selectedAlgo === "bellman_ford" ? "Bellman & Ford" : selectedAlgo === "a_star" ? "Hart, Nilsson" : "Floyd, Warshall"}
+                  </div>
+                </div>
+                <div className={`p-2 rounded-xl ${isDarkMode ? "bg-slate-800" : "bg-slate-50"} border border-slate-100 dark:border-slate-700`}>
+                  <div className="text-[8px] text-slate-400 font-bold uppercase tracking-wider">Metrik Kompleksitas</div>
+                  <div className="font-mono font-extrabold text-indigo-500 mt-0.5 text-[9px] truncate">
+                    {selectedAlgo === "dijkstra" ? "O((V+E)log V)" : selectedAlgo === "bellman_ford" ? "O(V * E)" : selectedAlgo === "a_star" ? "Heuristik O(E)" : "O(V³)"}
+                  </div>
+                </div>
+              </div>
+
+              {/* About description */}
+              <div>
+                <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest block mb-1">Definisi Singkat</span>
+                <p className={`${isDarkMode ? "text-slate-300" : "text-slate-600"} leading-relaxed text-[11px] font-medium`}>
+                  {selectedAlgo === "dijkstra"
+                    ? "Mencari jalur terpendek satu sumber pada graf dengan bobot sisi positif secara optimal."
+                    : selectedAlgo === "bellman_ford"
+                      ? "Mencari jalur terpendek satu sumber yang mendukung bobot negatif dan mendeteksi siklus negatif."
+                      : selectedAlgo === "a_star"
+                        ? "Menggunakan heuristik jarak udara untuk mengarahkan pencarian langsung ke target secara cepat."
+                        : "Mencari jalur terpendek antara semua pasangan titik secara serentak."}
+                </p>
+              </div>
+
+              {/* Pros */}
+              <div>
+                <span className="text-[9px] font-bold text-emerald-500 uppercase tracking-widest block mb-1">Kelebihan (Pros)</span>
+                <ul className="space-y-1 text-[11px] pl-0">
+                  <li className="flex items-start gap-1">
+                    <span className="text-emerald-500 font-bold">✓</span>
+                    <span className="text-slate-600 dark:text-slate-300 font-medium">
+                      {selectedAlgo === "dijkstra"
+                        ? "Menjamin keakuratan lintasan terpendek mutlak."
+                        : selectedAlgo === "bellman_ford"
+                          ? "Tangguh menangani biaya negatif (promo/eco bonus)."
+                          : selectedAlgo === "a_star"
+                            ? "Sangat cepat, efisien mengeksplorasi sedikit simpul."
+                            : "Menghasilkan rute antar seluruh pasang titik sekaligus."}
+                    </span>
+                  </li>
+                  <li className="flex items-start gap-1">
+                    <span className="text-emerald-500 font-bold">✓</span>
+                    <span className="text-slate-600 dark:text-slate-300 font-medium">
+                      {selectedAlgo === "dijkstra"
+                        ? "Efisien pada jaringan graf jalanan sedang."
+                        : selectedAlgo === "bellman_ford"
+                          ? "Mendeteksi looping negatif yang berbahaya."
+                          : selectedAlgo === "a_star"
+                            ? "Pilihan ideal untuk GPS modern & game AI."
+                            : "Sangat mudah diprogram dan diintegrasikan."}
+                    </span>
+                  </li>
+                </ul>
+              </div>
+
+              {/* Cons */}
+              <div>
+                <span className="text-[9px] font-bold text-rose-500 uppercase tracking-widest block mb-1">Batasan (Cons)</span>
+                <p className={`${isDarkMode ? "text-slate-300" : "text-slate-600"} leading-normal text-[11px] font-medium`}>
+                  {selectedAlgo === "dijkstra"
+                    ? "Gagal berfungsi dengan benar jika terdapat bobot negatif."
+                    : selectedAlgo === "bellman_ford"
+                      ? "Kecepatan eksekusi lambat untuk graf raksasa."
+                      : selectedAlgo === "a_star"
+                        ? "Sangat sensitif terhadap akurasi perhitungan fungsi heuristik."
+                        : "Kurang efisien untuk graf dengan jumlah simpul sangat besar."}
+                </p>
+              </div>
+            </div>
+
+            {/* Bottom action */}
+            <div className="pt-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setIsAdvantagesModalOpen(false)}
+                className="w-full bg-slate-800 hover:bg-slate-700 text-white font-bold py-2.5 rounded-xl transition-all text-xs uppercase tracking-wider"
+              >
+                Mengerti
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -937,6 +1617,7 @@ const ScheduleView = ({
   overlapColors,
   isomorphicTemplateDetected,
   onApplyIsomorphic,
+  onResolveConflict,
   selectedDate,
   setSelectedDate,
   onAddClick,
@@ -948,6 +1629,7 @@ const ScheduleView = ({
   overlapColors: Record<string, string>;
   isomorphicTemplateDetected: boolean;
   onApplyIsomorphic: () => void;
+  onResolveConflict: (id: string) => void;
   selectedDate: string;
   setSelectedDate: (d: string) => void;
   onAddClick: () => void;
@@ -990,16 +1672,14 @@ const ScheduleView = ({
 
   return (
     <div
-      className={`absolute inset-0 flex flex-col pt-12 pb-24 h-full overflow-hidden ${
-        isDarkMode ? "bg-slate-950" : "bg-slate-100"
-      }`}
+      className={`absolute inset-0 flex flex-col pt-12 pb-24 h-full overflow-hidden ${isDarkMode ? "bg-slate-950" : "bg-slate-100"
+        }`}
     >
       <div className="px-6 mb-4 shrink-0">
         <div className="flex justify-between items-center mb-1">
           <h1
-            className={`text-[34px] font-extrabold tracking-tight leading-none ${
-              isDarkMode ? "text-white" : "text-slate-800"
-            }`}
+            className={`text-[34px] font-extrabold tracking-tight leading-none ${isDarkMode ? "text-white" : "text-slate-800"
+              }`}
           >
             Retrack
           </h1>
@@ -1022,25 +1702,22 @@ const ScheduleView = ({
               <button
                 key={d.fullDate}
                 onClick={() => setSelectedDate(d.fullDate)}
-                className={`flex flex-col items-center justify-center rounded-[20px] w-[56px] h-[82px] shrink-0 transition-all shadow-sm outline-none ${
-                  isActive
-                    ? "bg-blue-600 text-white scale-105"
-                    : isDarkMode
+                className={`flex flex-col items-center justify-center rounded-[20px] w-[56px] h-[82px] shrink-0 transition-all shadow-sm outline-none ${isActive
+                  ? "bg-blue-600 text-white scale-105"
+                  : isDarkMode
                     ? "bg-slate-900 text-slate-400 border border-slate-800 hover:bg-slate-800"
                     : "bg-white text-slate-800 border border-black/5 hover:bg-slate-50"
-                }`}
+                  }`}
               >
                 <span
-                  className={`text-[10px] font-bold mb-1 tracking-wider uppercase ${
-                    isActive ? "text-blue-100" : "text-slate-400"
-                  }`}
+                  className={`text-[10px] font-bold mb-1 tracking-wider uppercase ${isActive ? "text-blue-100" : "text-slate-400"
+                    }`}
                 >
                   {d.name}
                 </span>
                 <span
-                  className={`text-lg font-extrabold ${
-                    isActive ? "text-white" : isDarkMode ? "text-slate-400" : "text-slate-800"
-                  }`}
+                  className={`text-lg font-extrabold ${isActive ? "text-white" : isDarkMode ? "text-slate-400" : "text-slate-800"
+                    }`}
                 >
                   {d.num}
                 </span>
@@ -1096,26 +1773,35 @@ const ScheduleView = ({
               )}
             </div>
 
-            {graphConflicts.length > 0 ? (
+            {graphConflicts.filter(c => !c.message.includes("telah terlewati")).length > 0 ? (
               <div className="space-y-2">
-                {graphConflicts.map((conf, idx) => (
+                {graphConflicts.filter(c => !c.message.includes("telah terlewati")).map((conf, idx) => (
                   <div
                     key={idx}
                     className="bg-red-500/10 border border-red-500/20 text-red-500 rounded-xl p-3 flex gap-2.5 items-start"
                   >
                     <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 animate-bounce" />
-                    <div className="flex flex-col">
+                    <div className="flex flex-col flex-1">
                       <span className="text-[10px] font-bold uppercase tracking-wider text-red-600">
-                        Tight Route Conflict Detected
+                        Schedule Conflict Alert
                       </span>
                       <p className="text-xs font-semibold leading-normal">{conf.message}</p>
+                      {conf.type === 'FLEX_FAILED' && conf.flexId && (
+                        <button
+                          onClick={() => onResolveConflict(conf.flexId)}
+                          className="mt-2 text-[10px] font-bold uppercase tracking-wider bg-red-600 hover:bg-red-700 text-white py-2 px-3 rounded-lg shadow-sm transition-all focus:outline-none focus:ring-2 focus:ring-red-400 w-fit cursor-pointer flex items-center gap-1 active:scale-95"
+                        >
+                          <Zap className="w-3 h-3" />
+                          Cari Solusi Alternatif & Kurangi Durasi
+                        </button>
+                      )}
                     </div>
                   </div>
                 ))}
               </div>
             ) : (
               <div className={`text-xs py-2.5 px-3 rounded-lg border ${isDarkMode ? "border-slate-800 text-slate-400 bg-slate-900/30" : "border-slate-200 text-slate-500 bg-white"}`}>
-                <span>Semua rute aman. Validasi rute aktif berdasarkan waktu WIB di atas.</span>
+                <span>Semua jadwal dan rute waktu mendatang aman.</span>
               </div>
             )}
           </div>
@@ -1128,127 +1814,137 @@ const ScheduleView = ({
           )}
 
           {todaysActivities.map((act, i) => {
-          const isFirstOrLast = i === 0 || i === todaysActivities.length - 1;
-          const isOverlapConflict = !!overlapColors[act.id];
-          const clashColor = overlapColors[act.id] || "";
+            const isFirstOrLast = i === 0 || i === todaysActivities.length - 1;
+            const isOverlapConflict = !!overlapColors[act.id];
+            const clashColor = overlapColors[act.id] || "";
 
-          return (
-            <div key={act.id} className="flex gap-4 mb-5 relative group">
-              <div
-                className={`pt-5 z-10 shrink-0 w-8 flex justify-center ${
-                  isDarkMode ? "bg-slate-950" : "bg-slate-100"
-                }`}
-              >
-                {clashColor ? (
-                  <div
-                    style={{ backgroundColor: clashColor }}
-                    className="w-[20px] h-[20px] rounded-full border-4 border-white ring-4 ring-red-400 flex items-center justify-center text-white text-[9px] font-extrabold shadow-sm animate-pulse"
-                  >
-                    !
-                  </div>
-                ) : isFirstOrLast ? (
-                  <div className="w-[18px] h-[18px] rounded-full border-4 border-blue-600 ring-4 ring-blue-100 bg-white"></div>
-                ) : (
-                  <div className="w-[14px] h-[14px] rounded-full border border-slate-400 bg-white ring-4 ring-slate-100"></div>
-                )}
-              </div>
+            return (
+              <div key={act.id} className="flex gap-4 mb-5 relative group">
+                <div
+                  className={`pt-5 z-10 shrink-0 w-8 flex justify-center ${isDarkMode ? "bg-slate-950" : "bg-slate-100"
+                    }`}
+                >
+                  {clashColor ? (
+                    <div
+                      style={{ backgroundColor: clashColor }}
+                      className={`w-[20px] h-[20px] rounded-full border-4 border-white ${clashColor === "#10B981" ? "ring-4 ring-emerald-200" : "ring-4 ring-red-400"
+                        } flex items-center justify-center text-white text-[9px] font-extrabold shadow-sm ${clashColor === "#10B981" ? "" : "animate-pulse"
+                        }`}
+                    >
+                      {clashColor === "#10B981" ? "✓" : "!"}
+                    </div>
+                  ) : isFirstOrLast ? (
+                    <div className="w-[18px] h-[18px] rounded-full border-4 border-blue-600 ring-4 ring-blue-100 bg-white"></div>
+                  ) : (
+                    <div className="w-[14px] h-[14px] rounded-full border border-slate-400 bg-white ring-4 ring-slate-100"></div>
+                  )}
+                </div>
 
-              <div
-                style={{
-                  borderLeftColor: clashColor ? clashColor : undefined,
-                  borderLeftWidth: clashColor ? "4px" : undefined,
-                }}
-                className={`${
-                  isDarkMode
+                <div
+                  style={{
+                    borderLeftColor: clashColor ? clashColor : undefined,
+                    borderLeftWidth: clashColor ? "4px" : undefined,
+                  }}
+                  className={`${isDarkMode
                     ? "bg-slate-900 border-slate-800"
                     : "bg-white border-black/[0.04]"
-                } rounded-2xl p-4 flex-1 shadow-sm border transition-all relative flex flex-col`}
-              >
-                <div className="flex justify-between items-start gap-4">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <h3
-                      className={`text-[16px] font-extrabold tracking-tight ${
-                        isDarkMode ? "text-white" : "text-slate-900"
-                      }`}
+                    } rounded-2xl p-4 flex-1 shadow-sm border transition-all relative flex flex-col`}
+                >
+                  <div className="flex justify-between items-start gap-4">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h3
+                        className={`text-[16px] font-extrabold tracking-tight ${isDarkMode ? "text-white" : "text-slate-900"
+                          }`}
+                      >
+                        {act.title}
+                      </h3>
+                      {act.isAlways && (
+                        <span className="text-[9px] uppercase tracking-widest font-black shrink-0 px-2 py-0.5 rounded-full flex items-center bg-blue-100 text-blue-600 dark:bg-blue-900/40 dark:text-blue-400">
+                          Rutin
+                        </span>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => onRemoveClick(act.id)}
+                      className="shrink-0 text-slate-400 hover:text-red-500 rounded-lg p-0.5 transition-colors focus:outline-none"
                     >
-                      {act.title}
-                    </h3>
-                    {act.isAlways && (
-                      <span className="text-[9px] uppercase tracking-widest font-black shrink-0 px-2 py-0.5 rounded-full flex items-center bg-blue-100 text-blue-600 dark:bg-blue-900/40 dark:text-blue-400">
-                        Rutin
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+
+                  <div className="flex items-center gap-2.5 mt-2 flex-wrap text-slate-500">
+                    <div className="flex items-center gap-1.5 text-xs font-semibold shrink-0">
+                      <Clock className="w-3.5 h-3.5 opacity-75 text-indigo-500" />
+                      <span>
+                        {act.type === "FIXED" ? (
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-xs font-black bg-blue-100 text-blue-900 border border-blue-200 dark:bg-blue-950/60 dark:text-blue-100 dark:border-blue-900/50 shadow-sm shrink-0">
+                            {act.timeWindow?.start || "00:00"} - {act.timeWindow?.end || "00:00"}
+                          </span>
+                        ) : (
+                          <span className={`inline-flex items-center gap-2 px-2.5 py-1 rounded-xl text-xs font-extrabold shadow-sm ${act.timeWindow?.start
+                            ? "bg-indigo-600 text-white dark:bg-indigo-500"
+                            : "bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
+                            }`}>
+                            <Zap className={`w-3.5 h-3.5 ${act.timeWindow?.start ? "text-yellow-300 animate-pulse shrink-0" : "text-amber-600 dark:text-amber-400 shrink-0"}`} />
+                            <span className="shrink-0">Calculated: <span className={act.timeWindow?.start ? "underline decoration-yellow-300 decoration-2 font-black" : ""}>{act.timeWindow?.start || "Pending"}</span></span>
+                            <span className={`${act.timeWindow?.start ? "bg-black/20 text-white/90 border-l border-white/20 pl-2" : "bg-amber-200/50 dark:bg-amber-900/40"} px-1.5 py-0.5 rounded-md text-[10px] font-black inline-flex items-center gap-0.5 shrink-0`}>
+                              ⏳ {act.durationMinutes}m
+                            </span>
+                          </span>
+                        )}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 text-xs font-semibold overflow-hidden">
+                      <MapPin className="w-3.5 h-3.5 opacity-75 text-rose-500 shrink-0" />
+                      <span className="truncate max-w-[150px]">{act.location?.name || "No location info"}</span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 mt-2.5">
+                    <span
+                      className={`text-[9.5px] tracking-wider uppercase font-black px-2.5 py-1 rounded-lg border shadow-xs transition-all ${act.type === "FIXED"
+                        ? "bg-blue-600 text-white border-blue-700 dark:bg-blue-700 dark:border-blue-600 font-extrabold"
+                        : "bg-yellow-100 text-yellow-850 border-yellow-200 dark:bg-yellow-950/40 dark:text-yellow-250 dark:border-yellow-905/30"
+                        }`}
+                    >
+                      {act.type === "FIXED" ? "📌 Fixed Node (Jadwal Tetap)" : "🏃 Flexible Node"}
+                    </span>
+
+                    {act.isPoiSelector && (
+                      <span className="text-[9px] font-bold text-teal-600 bg-teal-50 dark:bg-teal-950/20 px-2 py-0.5 rounded-md flex items-center gap-1">
+                        <Coffee className="w-2.5 h-2.5" /> Bipartite POI Search
+                      </span>
+                    )}
+
+                    {isOverlapConflict && clashColor !== "#10B981" && (
+                      <span
+                        className="text-[9px] font-bold px-2 py-0.5 rounded-md text-white shadow-sm"
+                        style={{ backgroundColor: clashColor }}
+                      >
+                        ⚔️ Jadwal Bertumpuk (Konflik)
                       </span>
                     )}
                   </div>
-                  <button
-                    onClick={() => onRemoveClick(act.id)}
-                    className="shrink-0 text-slate-400 hover:text-red-500 rounded-lg p-0.5 transition-colors focus:outline-none"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-
-                <div className="flex items-center gap-2.5 mt-2 flex-wrap text-slate-500">
-                  <div className="flex items-center gap-1.5 text-xs font-semibold shrink-0">
-                    <Clock className="w-3.5 h-3.5 opacity-75 text-indigo-500" />
-                    <span>
-                      {act.type === "FIXED" ? (
-                        `${act.timeWindow?.start || "00:00"} - ${act.timeWindow?.end || "00:00"}`
-                      ) : (
-                        <span className="text-amber-600 bg-amber-50 dark:bg-amber-950/40 px-1.5 py-0.5 rounded-md font-extrabold inline-flex items-center gap-1">
-                          Calculated: {act.timeWindow?.start || "Pending"} (⏳ {act.durationMinutes}m)
-                        </span>
-                      )}
-                    </span>
-                  </div>
-
-                  <div className="flex items-center gap-1.5 text-xs font-semibold overflow-hidden">
-                    <MapPin className="w-3.5 h-3.5 opacity-75 text-rose-500 shrink-0" />
-                    <span className="truncate max-w-[150px]">{act.location?.name || "No location info"}</span>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-2 mt-2.5">
-                  <span
-                    className={`text-[9px] tracking-wider uppercase font-extrabold px-2 py-0.5 rounded-md ${
-                      act.type === "FIXED"
-                        ? "bg-blue-100 text-blue-600 dark:bg-blue-950/40 dark:text-blue-200"
-                        : "bg-yellow-100 text-yellow-800 dark:bg-yellow-950/40 dark:text-yellow-200"
-                    }`}
-                  >
-                    {act.type === "FIXED" ? "🔗 Fixed Node" : "🏃 Flexible Node"}
-                  </span>
-
-                  {act.isPoiSelector && (
-                    <span className="text-[9px] font-bold text-teal-600 bg-teal-50 dark:bg-teal-950/20 px-2 py-0.5 rounded-md flex items-center gap-1">
-                      <Coffee className="w-2.5 h-2.5" /> Bipartite POI Search
-                    </span>
-                  )}
-
-                  {isOverlapConflict && (
-                    <span className="text-[9px] font-bold text-red-500 bg-red-50 dark:bg-red-950/20 px-2 py-0.5 rounded-md">
-                      ⚔️ Welsh-Powell Clash
-                    </span>
-                  )}
                 </div>
               </div>
-            </div>
-          );
-        })}
+            );
+          })}
 
-        {todaysActivities.length === 0 && (
-          <div className="text-center pt-16 px-6">
-            <div className="w-16 h-16 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-400 dark:text-slate-500 mx-auto mb-4 animate-pulse">
-              <Compass className="w-8 h-8" />
+          {todaysActivities.length === 0 && (
+            <div className="text-center pt-16 px-6">
+              <div className="w-16 h-16 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-400 dark:text-slate-500 mx-auto mb-4 animate-pulse">
+                <Compass className="w-8 h-8" />
+              </div>
+              <h4 className={`text-sm font-bold mb-1 ${isDarkMode ? "text-white" : "text-slate-700"}`}>
+                No Scheduled Activities
+              </h4>
+              <p className="text-xs text-slate-400">
+                Create a mixture of fixed schedule constraints and flexible priorities. Click "+" to form your graph.
+              </p>
             </div>
-            <h4 className={`text-sm font-bold mb-1 ${isDarkMode ? "text-white" : "text-slate-700"}`}>
-              No Scheduled Activities
-            </h4>
-            <p className="text-xs text-slate-400">
-              Create a mixture of fixed schedule constraints and flexible priorities. Click "+" to form your graph.
-            </p>
-          </div>
-        )}
-      </div></div>
+          )}
+        </div></div>
 
       <button
         onClick={onAddClick}
@@ -1282,9 +1978,8 @@ const ProfileView = ({
   onInstallClick: () => void;
 }) => (
   <div
-    className={`absolute inset-0 flex flex-col h-full overflow-y-auto pb-24 ${
-      isDarkMode ? "bg-slate-950" : "bg-[#F9FAFB]"
-    }`}
+    className={`absolute inset-0 flex flex-col h-full overflow-y-auto pb-24 ${isDarkMode ? "bg-slate-950" : "bg-[#F9FAFB]"
+      }`}
   >
     <div className={`px-6 pt-16 pb-8 ${isDarkMode ? "bg-slate-900" : "bg-white"}`}>
       <div className="flex items-center gap-5 mb-8">
@@ -1309,14 +2004,12 @@ const ProfileView = ({
 
       <div className="grid grid-cols-3 gap-3">
         <div
-          className={`flex flex-col items-center justify-center py-4 rounded-2xl ${
-            isDarkMode ? "bg-slate-900 border border-slate-800" : "bg-slate-50"
-          }`}
+          className={`flex flex-col items-center justify-center py-4 rounded-2xl ${isDarkMode ? "bg-slate-900 border border-slate-800" : "bg-slate-50"
+            }`}
         >
           <span
-            className={`text-xl font-extrabold mb-1 leading-none ${
-              isDarkMode ? "text-white" : "text-slate-800"
-            }`}
+            className={`text-xl font-extrabold mb-1 leading-none ${isDarkMode ? "text-white" : "text-slate-800"
+              }`}
           >
             12
           </span>
@@ -1325,9 +2018,8 @@ const ProfileView = ({
           </span>
         </div>
         <div
-          className={`flex flex-col items-center justify-center py-4 rounded-2xl ${
-            isDarkMode ? "bg-slate-900 border border-slate-800" : "bg-slate-50"
-          }`}
+          className={`flex flex-col items-center justify-center py-4 rounded-2xl ${isDarkMode ? "bg-slate-900 border border-slate-800" : "bg-slate-50"
+            }`}
         >
           <span className="text-xl font-extrabold text-blue-600 mb-1 leading-none">
             35%
@@ -1337,14 +2029,12 @@ const ProfileView = ({
           </span>
         </div>
         <div
-          className={`flex flex-col items-center justify-center py-4 rounded-2xl ${
-            isDarkMode ? "bg-slate-900 border border-slate-800" : "bg-slate-50"
-          }`}
+          className={`flex flex-col items-center justify-center py-4 rounded-2xl ${isDarkMode ? "bg-slate-900 border border-slate-800" : "bg-slate-50"
+            }`}
         >
           <span
-            className={`text-xl font-extrabold mb-1 leading-none ${
-              isDarkMode ? "text-white" : "text-slate-800"
-            }`}
+            className={`text-xl font-extrabold mb-1 leading-none ${isDarkMode ? "text-white" : "text-slate-800"
+              }`}
           >
             OSM
           </span>
@@ -1357,14 +2047,12 @@ const ProfileView = ({
 
     <div className="px-6 py-4 flex-1">
       <div
-        className={`rounded-3xl overflow-hidden border ${
-          isDarkMode ? "bg-slate-900 border border-slate-800" : "bg-white border-slate-100 shadow-sm"
-        }`}
+        className={`rounded-3xl overflow-hidden border ${isDarkMode ? "bg-slate-900 border border-slate-800" : "bg-white border-slate-100 shadow-sm"
+          }`}
       >
         <div
-          className={`flex items-center justify-between px-5 py-4 border-b ${
-            isDarkMode ? "border-slate-800" : "border-slate-100"
-          }`}
+          className={`flex items-center justify-between px-5 py-4 border-b ${isDarkMode ? "border-slate-800" : "border-slate-100"
+            }`}
         >
           <div className="flex items-center gap-3">
             <Settings className={`w-4 h-4 ${isDarkMode ? "text-slate-400" : "text-slate-500"}`} />
@@ -1376,22 +2064,19 @@ const ProfileView = ({
           </div>
           <button
             onClick={toggleDarkMode}
-            className={`w-11 h-6 rounded-full flex items-center p-1 transition-colors focus:outline-none ${
-              isDarkMode ? "bg-blue-600" : "bg-slate-300"
-            }`}
+            className={`w-11 h-6 rounded-full flex items-center p-1 transition-colors focus:outline-none ${isDarkMode ? "bg-blue-600" : "bg-slate-300"
+              }`}
           >
             <div
-              className={`w-4 h-4 rounded-full bg-white transition-transform ${
-                isDarkMode ? "translate-x-5" : "translate-x-0"
-              }`}
+              className={`w-4 h-4 rounded-full bg-white transition-transform ${isDarkMode ? "translate-x-5" : "translate-x-0"
+                }`}
             ></div>
           </button>
         </div>
 
         <div
-          className={`flex items-center justify-between px-5 py-4 border-b ${
-            isDarkMode ? "border-slate-800" : "border-slate-100"
-          }`}
+          className={`flex items-center justify-between px-5 py-4 border-b ${isDarkMode ? "border-slate-800" : "border-slate-100"
+            }`}
         >
           <div className="flex items-center gap-3">
             <Bell className={`w-4 h-4 ${isDarkMode ? "text-slate-400" : "text-slate-500"}`} />
@@ -1403,22 +2088,19 @@ const ProfileView = ({
           </div>
           <button
             onClick={onEnablePush}
-            className={`w-11 h-6 rounded-full flex items-center p-1 transition-colors focus:outline-none ${
-              isPushEnabled ? "bg-blue-600" : "bg-slate-300"
-            }`}
+            className={`w-11 h-6 rounded-full flex items-center p-1 transition-colors focus:outline-none ${isPushEnabled ? "bg-blue-600" : "bg-slate-300"
+              }`}
           >
             <div
-              className={`w-4 h-4 rounded-full bg-white transition-transform ${
-                isPushEnabled ? "translate-x-5" : "translate-x-0"
-              }`}
+              className={`w-4 h-4 rounded-full bg-white transition-transform ${isPushEnabled ? "translate-x-5" : "translate-x-0"
+                }`}
             ></div>
           </button>
         </div>
 
         <div
-          className={`flex items-center justify-between px-5 py-4 border-b ${
-            isDarkMode ? "border-slate-800" : "border-slate-100"
-          }`}
+          className={`flex items-center justify-between px-5 py-4 border-b ${isDarkMode ? "border-slate-800" : "border-slate-100"
+            }`}
         >
           <div className="flex items-center gap-3">
             <HelpCircle className={`w-4 h-4 ${isDarkMode ? "text-slate-400" : "text-slate-500"}`} />
@@ -1485,7 +2167,7 @@ export default function App() {
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [user, setUser] = useState<User | null>(null);
   const [isPushEnabled, setIsPushEnabled] = useState(false);
-  
+
   // PWA Install Prompt State
   const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
   const [isInstallable, setIsInstallable] = useState(false);
@@ -1578,10 +2260,10 @@ export default function App() {
     try {
       console.log("Requesting FCM token for user:", user.uid);
       const token = await requestNotificationPermissionAndGetToken();
-      
+
       if (token) {
         console.log("FCM token obtained, saving to server...");
-        
+
         // Save the token to our server endpoint which stores it in Firestore
         const saveRes = await fetch(`/api/users/${user.uid}/tokens`, {
           method: "POST",
@@ -1590,13 +2272,13 @@ export default function App() {
           },
           body: JSON.stringify({ token }),
         });
-        
+
         const saveData = await saveRes.json();
         console.log("Save token response:", saveRes.status, saveData);
-        
+
         if (saveRes.ok && saveData.success) {
           console.log("Token saved successfully. Sending test notification...");
-          
+
           // Also send a test verification notification
           try {
             const res = await fetch("/api/notifications/test", {
@@ -1608,7 +2290,7 @@ export default function App() {
             });
             const data = await res.json();
             console.log("Test notification response:", data);
-            
+
             if (data.success) {
               alert("✅ Notifikasi berhasil diaktifkan dan token telah disimpan ke database!");
             } else {
@@ -1642,6 +2324,32 @@ export default function App() {
   const [routeOptions, setRouteOptions] = useState<any[]>([]);
   const [graphConflicts, setGraphConflicts] = useState<any[]>([]);
   const [isomorphicTemplateDetected, setIsomorphicTemplateDetected] = useState(false);
+
+  const notifiedConflictsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!user || graphConflicts.length === 0) return;
+    
+    // Filter conflicts that haven't been notified yet
+    graphConflicts.forEach(conf => {
+      // Use message string as a unique identifier for the conflict
+      const confId = conf.message;
+      if (!notifiedConflictsRef.current.has(confId) && !confId.includes("telah terlewati")) {
+        notifiedConflictsRef.current.add(confId);
+        
+        // Send push notification
+        fetch("/api/notifications/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            uid: user.uid,
+            title: "⚠️ Tabrakan Jadwal Alert",
+            body: conf.message
+          })
+        }).catch(err => console.error("Failed to push schedule conflict notification", err));
+      }
+    });
+  }, [graphConflicts, user]);
 
   // Re-fetch routings and optimizations on schedule changes
   useEffect(() => {
@@ -1685,7 +2393,7 @@ export default function App() {
         setRouteOptions([]);
         setGraphConflicts([
           {
-            message: "Sistem routing OSRM offline. Jadwal dialihkan ke urutan waktu manual.",
+            message: "Sistem routing offline. Jadwal dialihkan ke urutan waktu manual.",
           },
         ]);
       }
@@ -1697,7 +2405,7 @@ export default function App() {
     // Tuesday historical pattern template
     const signatureTemplate = ["kuliahdiuniversitasairlangga", "belikopiterdekat", "makansiangenak", "rapatpengurusharian"];
     const currentSignature = rawToday.map((a) => a.title.toLowerCase().replace(/[^a-z]/g, "")).sort();
-    
+
     // Isomorphism logic: same set of vertices configuration regardless of raw initial indices
     const isIsomorphic =
       signatureTemplate.length === currentSignature.length &&
@@ -1710,6 +2418,28 @@ export default function App() {
     // Isomorphic pattern optimizes the sorting sequence instantly
     alert("Graf Isomorfik diterapkan! Menggunakan susunan rute teroptimasi historis.");
     setIsomorphicTemplateDetected(false);
+  };
+
+  const handleResolveConflict = (flexId: string) => {
+    const act = activities.find(a => a.id === flexId);
+    if (!act) return;
+
+    // Simulate resolution: cut duration by 15 mins (minimum 15 mins)
+    const newDuration = Math.max(15, (act.durationMinutes || 30) - 15);
+    const newActivities = activities.map(a => {
+      if (a.id === flexId) {
+        return {
+          ...a,
+          durationMinutes: newDuration
+        };
+      }
+      return a;
+    });
+    setActivities(newActivities);
+    if (user) {
+      const updatedAct = newActivities.find(a => a.id === flexId)!;
+      updateActivityInDb(flexId, updatedAct).catch(console.error);
+    }
   };
 
   const handleMapDoubleClick = (lat: number, lng: number) => {
@@ -1802,6 +2532,7 @@ export default function App() {
       id: String(Date.now()),
       title: newActivityTitle,
       type: newActivityType,
+      durationMinutes: newActivityType === "FLEXIBLE" ? newActivityDuration : undefined,
       timeWindow: {
         start: newActivityStartTime,
         end: newActivityEndTime,
@@ -1813,7 +2544,7 @@ export default function App() {
 
     setActivities((prev) => {
       const updated = [...prev, newAct];
-      
+
       if (user) {
         saveActivityToDb(user.uid, newAct).catch(e => console.error("Failed saving to DB", e));
       } else {
@@ -1824,14 +2555,14 @@ export default function App() {
       if (user && newAct.type === "FIXED" && newAct.timeWindow.start && newAct.timeWindow.end) {
         const start1 = timeToMins(newAct.timeWindow.start);
         const end1 = timeToMins(newAct.timeWindow.end);
-        
+
         const overlappingAct = prev.find(a => {
           if (a.date !== newAct.date || a.type !== "FIXED" || !a.timeWindow?.start || !a.timeWindow?.end) return false;
           const start2 = timeToMins(a.timeWindow.start);
           const end2 = timeToMins(a.timeWindow.end);
           return start1 < end2 && start2 < end1;
         });
-        
+
         if (overlappingAct) {
           fetch("/api/notifications/overlap", {
             method: "POST",
@@ -1844,7 +2575,7 @@ export default function App() {
           }).catch(err => console.error("Failed to trigger overlap notification", err));
         }
       }
-      
+
       return updated;
     });
 
@@ -1865,15 +2596,14 @@ export default function App() {
   };
 
   // Run graph coloring Welsh-Powell
-  const overlapColors = colorOverlapGraph(todaysActivities);
+  const overlapColors = colorOverlapGraph(todaysActivities, graphConflicts);
 
   return (
     <div
-      className={`flex flex-col h-screen w-full relative overflow-hidden font-sans antialiased mx-auto sm:max-w-md sm:border-x transition-colors ${
-        isDarkMode
-          ? "bg-slate-950 text-slate-200 sm:border-slate-800"
-          : "bg-slate-100 text-gray-900 sm:border-gray-200 sm:shadow-2xl"
-      }`}
+      className={`flex flex-col h-screen w-full relative overflow-hidden font-sans antialiased mx-auto sm:max-w-md sm:border-x transition-colors ${isDarkMode
+        ? "bg-slate-950 text-slate-200 sm:border-slate-800"
+        : "bg-slate-100 text-gray-900 sm:border-gray-200 sm:shadow-2xl"
+        }`}
     >
       <style>{`.hide-scrollbar::-webkit-scrollbar, .no-scrollbar::-webkit-scrollbar { display: none; } .hide-scrollbar, .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }`}</style>
 
@@ -1895,6 +2625,7 @@ export default function App() {
             overlapColors={overlapColors}
             isomorphicTemplateDetected={isomorphicTemplateDetected}
             onApplyIsomorphic={handleApplyIsomorphicPreset}
+            onResolveConflict={handleResolveConflict}
             selectedDate={selectedDate}
             setSelectedDate={setSelectedDate}
             onAddClick={() => setIsModalOpen(true)}
@@ -1922,9 +2653,8 @@ export default function App() {
       {isModalOpen && (
         <div className="absolute inset-0 z-[3000] flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-[2px]">
           <div
-            className={`${
-              isDarkMode ? "bg-slate-900" : "bg-white"
-            } rounded-[28px] p-6 w-full max-w-sm shadow-2xl relative max-h-[85vh] flex flex-col`}
+            className={`${isDarkMode ? "bg-slate-900" : "bg-white"
+              } rounded-[28px] p-6 w-full max-w-sm shadow-2xl relative max-h-[85vh] flex flex-col`}
           >
             <button
               onClick={() => setIsModalOpen(false)}
@@ -1938,9 +2668,8 @@ export default function App() {
                 <Plus className="w-5 h-5" strokeWidth={3} />
               </div>
               <h3
-                className={`text-[20px] font-extrabold tracking-tight ${
-                  isDarkMode ? "text-white" : "text-slate-800"
-                }`}
+                className={`text-[20px] font-extrabold tracking-tight ${isDarkMode ? "text-white" : "text-slate-800"
+                  }`}
               >
                 Add Agenda Graph Node
               </h3>
@@ -1954,9 +2683,8 @@ export default function App() {
                 <input
                   value={newActivityTitle}
                   onChange={(e) => setNewActivityTitle(e.target.value)}
-                  className={`w-full border border-transparent rounded-2xl px-4 py-3 text-[15px] font-semibold focus:outline-none focus:ring-2 focus:ring-[#2563eb]/20 transition-all ${
-                    isDarkMode ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-800"
-                  }`}
+                  className={`w-full border border-transparent rounded-2xl px-4 py-3 text-[15px] font-semibold focus:outline-none focus:ring-2 focus:ring-[#2563eb]/20 transition-all ${isDarkMode ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-800"
+                    }`}
                   placeholder="e.g. Kuliah Airlangga, Rapat"
                 />
               </div>
@@ -1969,26 +2697,24 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setNewActivityType("FIXED")}
-                    className={`flex-1 py-2.5 rounded-2xl text-xs font-bold transition-all border ${
-                      newActivityType === "FIXED"
-                        ? "bg-blue-600 text-white border-blue-600 shadow-md shadow-blue-500/20"
-                        : isDarkMode
+                    className={`flex-1 py-2.5 rounded-2xl text-xs font-bold transition-all border ${newActivityType === "FIXED"
+                      ? "bg-blue-600 text-white border-blue-600 shadow-md shadow-blue-500/20"
+                      : isDarkMode
                         ? "bg-slate-800 text-slate-400 border-slate-700 hover:bg-slate-700 hover:text-white"
                         : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
-                    }`}
+                      }`}
                   >
                     🔗 Fixed Node
                   </button>
                   <button
                     type="button"
                     onClick={() => setNewActivityType("FLEXIBLE")}
-                    className={`flex-1 py-2.5 rounded-2xl text-xs font-bold transition-all border ${
-                      newActivityType === "FLEXIBLE"
-                        ? "bg-purple-600 text-white border-purple-600 shadow-md shadow-purple-500/20"
-                        : isDarkMode
+                    className={`flex-1 py-2.5 rounded-2xl text-xs font-bold transition-all border ${newActivityType === "FLEXIBLE"
+                      ? "bg-purple-600 text-white border-purple-600 shadow-md shadow-purple-500/20"
+                      : isDarkMode
                         ? "bg-slate-800 text-slate-400 border-slate-700 hover:bg-slate-700 hover:text-white"
                         : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
-                    }`}
+                      }`}
                   >
                     🏃 Flexible Node
                   </button>
@@ -1997,16 +2723,15 @@ export default function App() {
 
               <div className="relative">
                 <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase tracking-wider">
-                  Location (OpenStreetMap Nominatim API)
+                  Location
                 </label>
                 <div className="relative flex items-center">
                   <MapPin className="absolute left-3 w-4 h-4 text-slate-400" />
                   <input
                     value={locationQuery}
                     onChange={(e) => handleSearchLocation(e.target.value)}
-                    className={`w-full border border-transparent rounded-2xl pl-10 pr-4 py-3 text-[14px] font-semibold focus:outline-none focus:ring-2 focus:ring-[#2563eb]/20 transition-all ${
-                      isDarkMode ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-800"
-                    }`}
+                    className={`w-full border border-transparent rounded-2xl pl-10 pr-4 py-3 text-[14px] font-semibold focus:outline-none focus:ring-2 focus:ring-[#2563eb]/20 transition-all ${isDarkMode ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-800"
+                      }`}
                     placeholder="Search location..."
                   />
                 </div>
@@ -2044,33 +2769,46 @@ export default function App() {
                 )}
               </div>
 
-              <div className="flex gap-2">
-                <div className="flex-1">
-                  <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase tracking-wider">
+              <div className={`grid gap-2 ${newActivityType === "FLEXIBLE" ? "grid-cols-3" : "grid-cols-2"}`}>
+                <div className="w-full min-w-0">
+                  <label className="block text-[9px] sm:text-[10px] font-bold text-slate-400 mb-1.5 uppercase tracking-wider whitespace-normal leading-tight">
                     Start Time
                   </label>
                   <input
                     type="time"
                     value={newActivityStartTime}
                     onChange={(e) => setNewActivityStartTime(e.target.value)}
-                    className={`w-full border border-transparent rounded-2xl px-4 py-3 text-[14px] font-semibold focus:outline-none focus:ring-2 focus:ring-[#2563eb]/20 transition-all ${
-                      isDarkMode ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-800"
-                    }`}
+                    className={`w-full border border-transparent rounded-2xl px-2 sm:px-4 py-3 text-[13px] sm:text-[14px] font-semibold focus:outline-none focus:ring-2 focus:ring-[#2563eb]/20 transition-all ${isDarkMode ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-800"
+                      }`}
                   />
                 </div>
-                <div className="flex-1">
-                  <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase tracking-wider">
+                <div className="w-full min-w-0">
+                  <label className="block text-[9px] sm:text-[10px] font-bold text-slate-400 mb-1.5 uppercase tracking-wider whitespace-normal leading-tight">
                     End Time
                   </label>
                   <input
                     type="time"
                     value={newActivityEndTime}
                     onChange={(e) => setNewActivityEndTime(e.target.value)}
-                    className={`w-full border border-transparent rounded-2xl px-4 py-3 text-[14px] font-semibold focus:outline-none focus:ring-2 focus:ring-[#2563eb]/20 transition-all ${
-                      isDarkMode ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-800"
-                    }`}
+                    className={`w-full border border-transparent rounded-2xl px-2 sm:px-4 py-3 text-[13px] sm:text-[14px] font-semibold focus:outline-none focus:ring-2 focus:ring-[#2563eb]/20 transition-all ${isDarkMode ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-800"
+                      }`}
                   />
                 </div>
+                {newActivityType === "FLEXIBLE" && (
+                  <div className="w-full min-w-0">
+                    <label className="block text-[9px] sm:text-[10px] font-bold text-slate-400 mb-1.5 uppercase tracking-wider whitespace-normal leading-tight">
+                      Duration (min)
+                    </label>
+                    <input
+                      type="number"
+                      min="1"
+                      value={newActivityDuration}
+                      onChange={(e) => setNewActivityDuration(Number(e.target.value))}
+                      className={`w-full border border-transparent rounded-2xl px-2 sm:px-4 py-3 text-[13px] sm:text-[14px] font-semibold focus:outline-none focus:ring-2 focus:ring-[#2563eb]/20 transition-all ${isDarkMode ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-800"
+                        }`}
+                    />
+                  </div>
+                )}
               </div>
 
               <div>
@@ -2082,9 +2820,8 @@ export default function App() {
                   value={newActivityDate}
                   disabled={newActivityIsAlways}
                   onChange={(e) => setNewActivityDate(e.target.value)}
-                  className={`w-full border border-transparent rounded-2xl px-4 py-3 text-[14px] font-semibold focus:outline-none focus:ring-2 focus:ring-[#2563eb]/20 transition-all ${
-                    isDarkMode ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-800"
-                  } ${newActivityIsAlways ? "opacity-50 cursor-not-allowed" : ""}`}
+                  className={`w-full border border-transparent rounded-2xl px-4 py-3 text-[14px] font-semibold focus:outline-none focus:ring-2 focus:ring-[#2563eb]/20 transition-all ${isDarkMode ? "bg-slate-800 text-white" : "bg-slate-100 text-slate-800"
+                    } ${newActivityIsAlways ? "opacity-50 cursor-not-allowed" : ""}`}
                 />
 
                 <label className="mt-4 flex items-center gap-3 cursor-pointer">
@@ -2098,7 +2835,7 @@ export default function App() {
                     className="hidden"
                   />
                   <div className="flex flex-col">
-                    <span className={`text-sm font-bold ${isDarkMode ? "text-white" : "text-slate-800"}`}>Ulangi Setiap Hari (Always)</span>
+                    <span className={`text-sm font-bold ${isDarkMode ? "text-white" : "text-slate-800"}`}>Ulangi Setiap Hari</span>
                     <span className={`text-[10px] leading-tight ${isDarkMode ? "text-slate-400" : "text-slate-500"}`}>Jadwal akan muncul di semua tanggal</span>
                   </div>
                 </label>
@@ -2120,24 +2857,21 @@ export default function App() {
 
       {/* Global Tab Bar Navigation */}
       <div
-        className={`absolute bottom-0 inset-x-0 border-t shadow-lg z-[4000] pb-6 sm:pb-3 pointer-events-auto shrink-0 transition-all ${
-          isDarkMode ? "bg-slate-900/90 backdrop-blur-md border-slate-800" : "bg-white border-slate-100"
-        }`}
+        className={`absolute bottom-0 inset-x-0 border-t shadow-lg z-[4000] pb-6 sm:pb-3 pointer-events-auto shrink-0 transition-all ${isDarkMode ? "bg-slate-900/90 backdrop-blur-md border-slate-800" : "bg-white border-slate-100"
+          }`}
       >
         <div className="flex justify-around items-center h-[76px] px-6 max-w-md mx-auto">
           <button
             onClick={() => setActiveTab("schedule")}
-            className={`flex flex-col items-center justify-center h-full gap-1 w-20 transition-all focus:outline-none ${
-              activeTab === "schedule"
-                ? "text-blue-600"
-                : "text-slate-400 hover:text-slate-600"
-            }`}
+            className={`flex flex-col items-center justify-center h-full gap-1 w-20 transition-all focus:outline-none ${activeTab === "schedule"
+              ? "text-blue-600"
+              : "text-slate-400 hover:text-slate-600"
+              }`}
           >
             <Calendar strokeWidth={3} className="w-[22px] h-[22px]" />
             <span
-              className={`text-[9px] uppercase tracking-wider ${
-                activeTab === "schedule" ? "font-bold" : "font-semibold"
-              }`}
+              className={`text-[9px] uppercase tracking-wider ${activeTab === "schedule" ? "font-bold" : "font-semibold"
+                }`}
             >
               Scheduler
             </span>
@@ -2145,17 +2879,15 @@ export default function App() {
 
           <button
             onClick={() => setActiveTab("map")}
-            className={`flex flex-col items-center justify-center h-full gap-1 w-20 transition-all focus:outline-none ${
-              activeTab === "map"
-                ? "text-blue-600"
-                : "text-slate-400 hover:text-slate-600"
-            }`}
+            className={`flex flex-col items-center justify-center h-full gap-1 w-20 transition-all focus:outline-none ${activeTab === "map"
+              ? "text-blue-600"
+              : "text-slate-400 hover:text-slate-600"
+              }`}
           >
             <MapIcon strokeWidth={3} className="w-[22px] h-[22px]" />
             <span
-              className={`text-[9px] uppercase tracking-wider ${
-                activeTab === "map" ? "font-bold" : "font-semibold"
-              }`}
+              className={`text-[9px] uppercase tracking-wider ${activeTab === "map" ? "font-bold" : "font-semibold"
+                }`}
             >
               Map Route
             </span>
@@ -2163,17 +2895,15 @@ export default function App() {
 
           <button
             onClick={() => setActiveTab("profile")}
-            className={`flex flex-col items-center justify-center h-full gap-1 w-20 transition-all focus:outline-none ${
-              activeTab === "profile"
-                ? "text-blue-600"
-                : "text-slate-400 hover:text-slate-600"
-            }`}
+            className={`flex flex-col items-center justify-center h-full gap-1 w-20 transition-all focus:outline-none ${activeTab === "profile"
+              ? "text-blue-600"
+              : "text-slate-400 hover:text-slate-600"
+              }`}
           >
             <UserIcon strokeWidth={3} className="w-[22px] h-[22px]" />
             <span
-              className={`text-[9px] uppercase tracking-wider ${
-                activeTab === "profile" ? "font-bold" : "font-semibold"
-              }`}
+              className={`text-[9px] uppercase tracking-wider ${activeTab === "profile" ? "font-bold" : "font-semibold"
+                }`}
             >
               Profile
             </span>
