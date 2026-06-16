@@ -592,7 +592,7 @@ const MapCanvas = ({
         }
 
         // Random chance of incident
-        if (!prev.event && nextIndex > 5 && nextIndex < prev.coords.length - 8 && Math.random() < 0.005) {
+        if (!prev.event && nextIndex > 5 && nextIndex < prev.coords.length - 8 && Math.random() < 0.010) {
           const events = [
             "🧠 Braess' Paradox: Kapasitas semu memicu macet (Agent Feedback)!",
             "🤖 Sensor Grid menemukan jalan buntu (D* Optimal Replanning)!",
@@ -633,12 +633,12 @@ const MapCanvas = ({
   useEffect(() => {
     if (simulation?.event && simulation.event !== "Tiba di tujuan! 🎉" && simulation.event !== "Semua kegiatan selesai! 🎉" && simulation.isActive) {
       let isCancelled = false;
-      
+
       const doReplanning = async () => {
         // Fetch immediately using the position at the time of the event
         const startIdx = simulation.currentIndex;
         const currentLoc = simulation.coords[startIdx] || simulation.coords[0] || [0, 0];
-        
+
         // Determine obstacle location: 15 steps ahead of the driver
         const obstacleIdx = Math.min(startIdx + 15, Math.max(0, simulation.coords.length - 2));
         const obstacleLoc = simulation.coords[obstacleIdx] || currentLoc;
@@ -660,7 +660,7 @@ const MapCanvas = ({
           try {
             const url = `https://api.geoapify.com/v1/routing?waypoints=${currentLoc[0]},${currentLoc[1]}|${destLat},${destLng}&mode=drive&apiKey=${apiKey}&avoid=${avoidStr}`;
             const fetchPromise = fetch(url);
-            
+
             // Wait for both the fetch and a 2.5s minimum display time for the popup
             const [res] = await Promise.all([
               fetchPromise,
@@ -701,12 +701,12 @@ const MapCanvas = ({
           if (newCoords.length > 0) {
             setSimulation(prev => {
               if (!prev) return null;
-              
+
               // The vehicle has kept moving. Find the closest point in newCoords to its live location
               const liveLoc = prev.coords[prev.currentIndex];
               let closestIndex = 0;
               let minDistance = Infinity;
-              
+
               for (let i = 0; i < newCoords.length; i++) {
                 const dx = newCoords[i][0] - liveLoc[0];
                 const dy = newCoords[i][1] - liveLoc[1];
@@ -1690,7 +1690,7 @@ const ScheduleView = ({
           </div>
         </div>
         <p className={`${isDarkMode ? "text-slate-400" : "text-slate-500"} text-sm font-medium`}>
-          Dynamic routing with Graph Theory & Spatial Data of Indonesia
+          Dynamic routing with Graph Theory & Spatial Data
         </p>
       </div>
 
@@ -2083,7 +2083,7 @@ const ProfileView = ({
             <span
               className={`font-semibold text-sm ${isDarkMode ? "text-white" : "text-slate-800"}`}
             >
-              Push Notification
+              Notification
             </span>
           </div>
           <button
@@ -2241,79 +2241,81 @@ export default function App() {
 
   const handleEnablePush = async () => {
     if (!user) {
-      alert("Harap login menggunakan akun Google terlebih dahulu untuk mengaktifkan Push Notifications.");
+      alert("Harap login menggunakan akun Google terlebih dahulu.");
       return;
     }
 
     if (isPushEnabled) {
-      // User is turning it OFF
-      const confirmOff = window.confirm("Nonaktifkan notifikasi? Perhatikan bahwa Anda mungkin juga perlu mencabut izin notifikasi di pengaturan browser (Site Settings).");
-      if (confirmOff) {
-        setIsPushEnabled(false);
-      }
+      const confirmOff = window.confirm("Nonaktifkan notifikasi?");
+      if (confirmOff) setIsPushEnabled(false);
       return;
     }
 
-    // User is turning it ON
-    setIsPushEnabled(true); // Optimistically set to true to show transition
+    setIsPushEnabled(true); // optimistic
 
     try {
-      console.log("Requesting FCM token for user:", user.uid);
-      const token = await requestNotificationPermissionAndGetToken();
+      // Import deleteToken untuk paksa refresh
+      const { getMessaging, deleteToken, getToken } = await import("firebase/messaging");
+      const messaging = getMessaging();
 
-      if (token) {
-        console.log("FCM token obtained, saving to server...");
-
-        // Save the token to our server endpoint which stores it in Firestore
-        const saveRes = await fetch(`/api/users/${user.uid}/tokens`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ token }),
-        });
-
-        const saveData = await saveRes.json();
-        console.log("Save token response:", saveRes.status, saveData);
-
-        if (saveRes.ok && saveData.success) {
-          console.log("Token saved successfully. Sending test notification...");
-
-          // Also send a test verification notification
-          try {
-            const res = await fetch("/api/notifications/test", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({ token, title: "Halo dari Retrack! 👋", body: "Perangkat ini telah berhasil terdaftar untuk notifikasi jadwal." }),
-            });
-            const data = await res.json();
-            console.log("Test notification response:", data);
-
-            if (data.success) {
-              alert("✅ Notifikasi berhasil diaktifkan dan token telah disimpan ke database!");
-            } else {
-              alert("⚠️ Token tersimpan di database, tetapi gagal mengirim notifikasi testing: " + (data.error || "Unknown Error"));
-            }
-          } catch (testErr) {
-            console.error("Test notification request failed:", testErr);
-            alert("✅ Token tersimpan di database! Tetapi pengiriman notifikasi testing gagal (mungkin masalah jaringan).");
-          }
-        } else {
-          setIsPushEnabled(false);
-          const errorMsg = saveData.error || `HTTP ${saveRes.status}`;
-          console.error("Failed to save token:", errorMsg);
-          alert(`❌ Gagal menyimpan token ke database: ${errorMsg}\n\nPastikan Firebase Admin SDK dikonfigurasi dengan benar di server.`);
-        }
-      } else {
-        setIsPushEnabled(false);
-        alert("❌ Gagal mendapatkan FCM token.\n\nKemungkinan penyebab:\n1. VAPID key belum benar di firebase.ts\n2. Service Worker gagal didaftarkan\n3. Browser memblokir notifikasi\n\nBuka Console browser (F12) untuk detail error.");
+      // 1. Hapus token lama dulu (ini yang fix "Third party auth error")
+      try {
+        await deleteToken(messaging);
+        console.log("Old token deleted, requesting fresh token...");
+      } catch (_) {
+        // Token belum ada, tidak masalah
       }
+
+      // 2. Minta token fresh
+      const freshToken = await getToken(messaging, {
+        vapidKey: import.meta.env.VITE_FIREBASE_VAPID_KEY,
+        serviceWorkerRegistration: await navigator.serviceWorker.ready,
+      });
+
+      if (!freshToken) {
+        setIsPushEnabled(false);
+        alert("❌ Gagal mendapatkan FCM token baru.");
+        return;
+      }
+
+      console.log("Fresh FCM token obtained:", freshToken);
+
+      // 3. Simpan token fresh ke server
+      const saveRes = await fetch(`/api/users/${user.uid}/tokens`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: freshToken }),
+      });
+      const saveData = await saveRes.json();
+
+      if (!saveRes.ok || !saveData.success) {
+        setIsPushEnabled(false);
+        alert(`❌ Gagal menyimpan token: ${saveData.error || saveRes.status}`);
+        return;
+      }
+
+      // 4. Test kirim notif (pakai freshToken langsung, bukan ambil dari DB)
+      const testRes = await fetch("/api/notifications/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          token: freshToken, // kirim token langsung, bukan lookup dari DB
+          title: "Halo dari Retrack! 👋",
+          body: "Perangkat ini telah berhasil terdaftar untuk notifikasi jadwal.",
+        }),
+      });
+      const testData = await testRes.json();
+
+      if (testData.success) {
+        alert("✅ Notifikasi berhasil diaktifkan!");
+      } else {
+        alert("⚠️ Token tersimpan, tapi test kirim gagal: " + (testData.error || "Unknown"));
+      }
+
     } catch (error: any) {
       setIsPushEnabled(false);
-      console.error("Error setting up push notifications:", error);
-      alert(`❌ Terjadi kesalahan:\n${error.message || "Unknown error"}\n\nBuka Console browser (F12) untuk detail.`);
+      console.error("Push setup error:", error);
+      alert(`❌ Error: ${error.message}`);
     }
   };
 
@@ -2329,14 +2331,14 @@ export default function App() {
 
   useEffect(() => {
     if (!user || graphConflicts.length === 0) return;
-    
+
     // Filter conflicts that haven't been notified yet
     graphConflicts.forEach(conf => {
       // Use message string as a unique identifier for the conflict
       const confId = conf.message;
       if (!notifiedConflictsRef.current.has(confId) && !confId.includes("telah terlewati")) {
         notifiedConflictsRef.current.add(confId);
-        
+
         // Send push notification
         fetch("/api/notifications/send", {
           method: "POST",
@@ -2350,6 +2352,8 @@ export default function App() {
       }
     });
   }, [graphConflicts, user]);
+
+
 
   // Re-fetch routings and optimizations on schedule changes
   useEffect(() => {

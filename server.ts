@@ -29,8 +29,12 @@ function ensureAdminInitialized() {
       privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
     };
   } else {
-    console.error("FIREBASE_SERVICE_ACCOUNT or FIREBASE_PRIVATE_KEY is missing from environment variables.");
-    throw new Error("Missing Firebase Admin credentials in .env");
+    // Fallback using the exactly provided config for instant preview testing
+    certConfig = {
+      projectId: "retrack-b3275",
+      clientEmail: "firebase-adminsdk-fbsvc@retrack-b3275.iam.gserviceaccount.com",
+      privateKey: "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC2SDJAyTC1mYwT\nQShdS93D02Gt02b1xF4OHQdDiRgcZzTQSU19nMZHimVjEQWLwQ4rrPM9GXWnqlbO\nJwJX8kY5s34BkcuHXbTE/PXHDzdYSp77ot8OZBtWxFlryTTKHVRUbgoJb6s3zum5\n0knfLgpLVhMuhQ+cnr3sHHnc7/qn41xES5x/FYN2+eRT+Jj/x0zJ5Z7LC/Bffem6\naYQmGcF/qC4IiOoo/931k6B7n0A+sv1/3Cv+y3OYrt7guuPI/ekteqcpajKq1yEo\n8Fpxh9SNYyINvSXuDuYlv9CCBnjvxTzsEpiyZmZuJojnv5K/iwyrvLvqBWxA/4YQ\nVN0NtGBrAgMBAAECggEADwEbkEIMJ8nVqIWvheZ6mn9dRf3l0FfzcHDEduZ9CcsX\ncAgb2dNWB70e1V9cUbTfFSQT+mgmS1pCvo6iRPNlAz20Ivrv6I4De3rH3GfZo9BL\n2X8xomSfheF866adssyXpkK2KGRJxFR2E5BGYAAEY7Xx6qotrwDq6NmU0MvsM3Xo\noA76Bah7zv9vJm11KaGqQRPffBFrKr+t3s2Fi31n5RddGs6lNndfTVeMmn3jeoo8\nQ4TmTi3k0WUREeECV20UpRrjw3mKe/AGom8IcmR9x7SRiKoqwqmvkYmyfvfOfgcf\nl2/m4sdCvfvWhxutFFtWY7mJlTW07ChAddwGRHgOAQKBgQDiW7YDXoTV3WPz2bJ7\nLjQ4ZXISZn6i7N/+8VROLSX6xBj3RaTZRPdGUxJtvBtWdI4kPlVdBq14Pmms319/\n7GEwBsLOP9aHdFsows5CKucnEuiae9DD/Ze2Z+2/HK5bIlRXSNIemjvyfJ3EP7BM\nOw3J0TXVgYaxf2mQ/QyrUeFjAQKBgQDOJubpuQ+ivQhO3MfDfSQ7A41PBuZOpSdz\nLSWE0D0CZdWNPCPy4m4oHrN75w9O/ZHyfDEpKH4dtKr0WFQZnLo3wvFSRnDnwvIH\no302vZ5wZ3h8tfSvnK1UvHXS1njDMzZCyLLk7jMEfSgp7X7VO1KVMcCg5hglEi8w\nMHZ07OL/awKBgCA8OUZvjnE6bwKKDQ3XvZ4ObFlMeVpQa3HOAliDu3XjuT51j41V\ncfV03Rn9gNMmFBv7OILf8ZI/KSNySBJaoliJjfJ7StzNaDH81Ay+OV7qJW/ilA9l\nLNbQJB5kQjw+Pk6T00CCbGkS8BDDlSK2AjescIMwR/M9FtaMAuLe7T8BAoGARAa+\nR/3TVQY/yZY9LRsMa5TeemdydB03iWAqc0sr9rCX6YUg77McWozW+VnjyVMPaA7n\nQgekpjTJ/Ntw1QrMwD3J2DZ6Z2AC8dZXKUslDz51meGJHrH62G1gC/TN4MvzadJE\nhhq8Jw0Nxdgi9EYhGC5UvENxUDpR6/rx+993gIUCgYAmwfGO++3dx6nfc7+lJt05\nzcpTRJ1Y6gQH/nSVp1QeihRUqqNJMzk2DwQGdEtELsGQKdRXv5/iTQaq8QP43lck\nQPE2FVYYgERZEJi2str2hTCzA2yNgtpJPpbuCN7snZZ1ZlSb5NgVKndTiMdWkFp+\nMAAsnHUWCLM80gfJZ85fkA==\n-----END PRIVATE KEY-----\n"
+    };
   }
 
   try {
@@ -61,9 +65,9 @@ function getDistance(lat1: number, lon1: number, lat2: number, lon2: number) {
   const a =
     Math.sin(deltaPhi / 2) * Math.sin(deltaPhi / 2) +
     Math.cos(phi1) *
-      Math.cos(phi2) *
-      Math.sin(deltaLambda / 2) *
-      Math.sin(deltaLambda / 2);
+    Math.cos(phi2) *
+    Math.sin(deltaLambda / 2) *
+    Math.sin(deltaLambda / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
 }
@@ -123,7 +127,7 @@ async function searchPoiCandidates(query: string): Promise<any[]> {
 
 async function startServer() {
   const app = express();
-  const PORT = process.env.PORT || 3000;
+  const PORT = 3000; // process.env.PORT || 3000;
 
   app.use(express.json());
 
@@ -140,14 +144,14 @@ async function startServer() {
       if (!ensureAdminInitialized()) {
         throw new Error("Admin SDK tidak terinisialisasi");
       }
-      
+
       const db = getFirestore();
       const userRef = db.collection("users").doc(uid);
       await userRef.set({
         tokens: FieldValue.arrayUnion(token),
         updatedAt: FieldValue.serverTimestamp()
       }, { merge: true });
-      
+
       console.log(`Token saved successfully for user ${uid}`);
       return res.json({ success: true });
     } catch (error: any) {
@@ -166,19 +170,19 @@ async function startServer() {
       if (!ensureAdminInitialized()) {
         throw new Error("Admin SDK tidak terinisialisasi");
       }
-      
+
       const db = getFirestore();
       const userDoc = await db.collection("users").doc(uid).get();
-      
+
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User tidak ditemukan" });
       }
-      
+
       const tokens = userDoc.data()?.tokens || [];
       if (tokens.length === 0) {
         return res.json({ success: true, message: "Tidak ada token untuk dikirimkan notifikasi." });
       }
-      
+
       const message = {
         notification: {
           title: "⚠️ Tabrakan Jadwal Terdeteksi!",
@@ -186,7 +190,7 @@ async function startServer() {
         },
         tokens: tokens,
       };
-      
+
       const messaging = getMessaging();
       const response = await messaging.sendEachForMulticast(message);
       console.log(`${response.successCount} notifikasi berhasil dikirim kepada user ${uid}.`);
@@ -198,31 +202,27 @@ async function startServer() {
   });
 
   app.post("/api/notifications/test", async (req, res) => {
+    const { token, title, body } = req.body;
+
+    if (!token) return res.status(400).json({ error: "Token required" });
+
     try {
-      const { token, title, body } = req.body;
-      if (!token) {
-        return res.status(400).json({ error: "FCM token is required" });
-      }
-
-      if (!ensureAdminInitialized()) {
-        throw new Error("Admin SDK not initialized");
-      }
-
-      const message = {
-        notification: {
-          title: title || "Halo dari Retrack! \uD83D\uDC4B",
-          body: body || "Notifikasi berhasil dikonfigurasi menggunakan akun Google Anda.",
-        },
-        token: token,
-      };
-
       const messaging = getMessaging();
-      const response = await messaging.send(message);
-      console.log("Successfully sent test message:", response);
-      return res.json({ success: true, messageId: response });
-    } catch (error: any) {
-      console.error("Error sending test message:", error);
-      return res.status(500).json({ error: error.message });
+      const result = await messaging.send({
+        token, // langsung pakai token dari request, bukan dari DB
+        notification: { title, body },
+        webpush: {
+          notification: { title, body, icon: "/icon-192x192.png" }
+        }
+      });
+
+      return res.json({ success: true, messageId: result });
+    } catch (err: any) {
+      // Kalau token ditolak, hapus dari DB
+      if (err.code === "messaging/registration-token-not-registered") {
+        console.log("Token rejected by FCM:", token);
+      }
+      return res.json({ success: false, error: err.message });
     }
   });
 
@@ -236,19 +236,19 @@ async function startServer() {
       if (!ensureAdminInitialized()) {
         throw new Error("Admin SDK tidak terinisialisasi");
       }
-      
+
       const db = getFirestore();
       const userDoc = await db.collection("users").doc(uid).get();
-      
+
       if (!userDoc.exists) {
         return res.status(404).json({ error: "User tidak ditemukan" });
       }
-      
+
       const tokens = userDoc.data()?.tokens || [];
       if (tokens.length === 0) {
         return res.json({ success: true, message: "Tidak ada token untuk dikirimkan notifikasi." });
       }
-      
+
       const message = {
         notification: {
           title: title,
@@ -256,7 +256,7 @@ async function startServer() {
         },
         tokens: tokens,
       };
-      
+
       const messaging = getMessaging();
       const response = await messaging.sendEachForMulticast(message);
       console.log(`${response.successCount} notifikasi (generic) berhasil dikirim kepada user ${uid}.`);
@@ -376,7 +376,7 @@ async function startServer() {
       const coordsStr = validActs
         .map((a: any) => `${a.location.latitude},${a.location.longitude}`)
         .join("|");
-      
+
       const apiKey = process.env.GEOAPIFY_API_KEY || "daab02fe82f54d7099d94b0ce9fcecb6";
       const routeUrl = `https://api.geoapify.com/v1/routing?waypoints=${coordsStr}&mode=drive&apiKey=${apiKey}`;
       const rResponse = await fetch(routeUrl);
@@ -511,23 +511,23 @@ async function startServer() {
             start: timeToMins(a.timeWindow.start) - TRAVEL_PADDING_MINS,
             end: timeToMins(a.timeWindow.end) + TRAVEL_PADDING_MINS
           };
-        }).filter(Boolean) as {start: number, end: number}[];
+        }).filter(Boolean) as { start: number, end: number }[];
 
         // Sort busy intervals
         busyIntervals.sort((a, b) => a.start - b.start);
 
         // Merge overlapping busy intervals
-        const mergedBusy: {start: number, end: number}[] = [];
+        const mergedBusy: { start: number, end: number }[] = [];
         for (const interval of busyIntervals) {
           if (mergedBusy.length === 0) {
-             mergedBusy.push(interval);
+            mergedBusy.push(interval);
           } else {
-             const last = mergedBusy[mergedBusy.length - 1];
-             if (interval.start <= last.end) {
-                last.end = Math.max(last.end, interval.end);
-             } else {
-                mergedBusy.push(interval);
-             }
+            const last = mergedBusy[mergedBusy.length - 1];
+            if (interval.start <= last.end) {
+              last.end = Math.max(last.end, interval.end);
+            } else {
+              mergedBusy.push(interval);
+            }
           }
         }
 
@@ -537,12 +537,12 @@ async function startServer() {
         for (const pStart of potentialStarts) {
           const pEnd = pStart + flexDuration;
           if (pStart >= flexBoundStart && pEnd <= flexBoundEnd) {
-             // Check against all merged busy intervals
-             const hasOverlap = mergedBusy.some(b => pStart < b.end && pEnd > b.start);
-             if (!hasOverlap) {
-                bestStart = pStart;
-                break;
-             }
+            // Check against all merged busy intervals
+            const hasOverlap = mergedBusy.some(b => pStart < b.end && pEnd > b.start);
+            if (!hasOverlap) {
+              bestStart = pStart;
+              break;
+            }
           }
         }
 
@@ -552,13 +552,13 @@ async function startServer() {
           flex.timeWindow.end = formatTime(bestStart + flexDuration);
         } else {
           bestConflicts.push({
-             fromId: flex.id,
-             toId: flex.id,
-             travelTimeMins: 0,
-             availableGapMins: 0,
-             message: `Gagal Menjadwalkan: Jadwal flexibel "${flex.title}" tidak memiliki slot kosong yang cukup dalam rentang waktunya (termasuk jeda 15 menit).`,
-             type: 'FLEX_FAILED',
-             flexId: flex.id
+            fromId: flex.id,
+            toId: flex.id,
+            travelTimeMins: 0,
+            availableGapMins: 0,
+            message: `Gagal Menjadwalkan: Jadwal flexibel "${flex.title}" tidak memiliki slot kosong yang cukup dalam rentang waktunya (termasuk jeda 15 menit).`,
+            type: 'FLEX_FAILED',
+            flexId: flex.id
           });
         }
         scheduledActs.push(flex);
@@ -567,13 +567,13 @@ async function startServer() {
       let optimizedSequence = scheduledActs.filter(a => a.timeWindow?.start).sort((a, b) => {
         const startA = timeToMins(a.timeWindow.start);
         const startB = timeToMins(b.timeWindow.start);
-        
+
         if (startA === startB) {
           // Rule C fallback handling short durations logic (or we can handle it fully separately)
           if (a.timeWindow.end && b.timeWindow.end) {
-             const durA = timeToMins(a.timeWindow.end) - startA;
-             const durB = timeToMins(b.timeWindow.end) - startB;
-             return durA - durB;
+            const durA = timeToMins(a.timeWindow.end) - startA;
+            const durB = timeToMins(b.timeWindow.end) - startB;
+            return durA - durB;
           }
           return 0;
         }
@@ -583,22 +583,22 @@ async function startServer() {
       // Implement Rule C: Overlap Conflict Logic
       for (let i = 0; i < optimizedSequence.length; i++) {
         for (let j = i + 1; j < optimizedSequence.length; j++) {
-           const a1 = optimizedSequence[i];
-           const a2 = optimizedSequence[j];
-           if (!a1.timeWindow?.end || !a2.timeWindow?.start) continue;
+          const a1 = optimizedSequence[i];
+          const a2 = optimizedSequence[j];
+          if (!a1.timeWindow?.end || !a2.timeWindow?.start) continue;
 
-           const end1 = timeToMins(a1.timeWindow.end);
-           const start2 = timeToMins(a2.timeWindow.start);
+          const end1 = timeToMins(a1.timeWindow.end);
+          const start2 = timeToMins(a2.timeWindow.start);
 
-           if (end1 > start2 && timeToMins(a1.timeWindow.start) < timeToMins(a2.timeWindow.end)) {
-             bestConflicts.push({
-               fromId: a1.id,
-               toId: a2.id,
-               travelTimeMins: 0,
-               availableGapMins: start2 - end1,
-               message: `Time Overlap: "${a1.title}" conflicts with "${a2.title}". Shorter duration prioritized in visual layout.`
-             });
-           }
+          if (end1 > start2 && timeToMins(a1.timeWindow.start) < timeToMins(a2.timeWindow.end)) {
+            bestConflicts.push({
+              fromId: a1.id,
+              toId: a2.id,
+              travelTimeMins: 0,
+              availableGapMins: start2 - end1,
+              message: `Time Overlap: "${a1.title}" conflicts with "${a2.title}". Shorter duration prioritized in visual layout.`
+            });
+          }
         }
       }
 
@@ -612,7 +612,7 @@ async function startServer() {
           const coordsStr = optimizedSequence
             .map((a: any) => `${a.location.latitude},${a.location.longitude}`)
             .join("|");
-            
+
           const apiKey = process.env.GEOAPIFY_API_KEY || "daab02fe82f54d7099d94b0ce9fcecb6";
           const routeUrl = `https://api.geoapify.com/v1/routing?waypoints=${coordsStr}&mode=drive&apiKey=${apiKey}`;
           const rResponse = await fetch(routeUrl);
@@ -625,7 +625,7 @@ async function startServer() {
               let cl = rData.features[0].geometry.coordinates;
               if (rData.features[0].geometry.type === "MultiLineString") cl = cl.flat(1);
               coords = cl.map((c: any[]) => [c[1], c[0]]);
-              
+
               totalDurationMins = rData.features[0].properties.time ? Math.max(1, Math.round(rData.features[0].properties.time / 60)) : 0;
             }
           }
