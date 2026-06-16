@@ -2330,16 +2330,13 @@ export default function App() {
   const notifiedConflictsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
-    if (!user || graphConflicts.length === 0) return;
+    if (!user || !isPushEnabled || graphConflicts.length === 0) return;
 
-    // Filter conflicts that haven't been notified yet
     graphConflicts.forEach(conf => {
-      // Use message string as a unique identifier for the conflict
       const confId = conf.message;
       if (!notifiedConflictsRef.current.has(confId) && !confId.includes("telah terlewati")) {
         notifiedConflictsRef.current.add(confId);
 
-        // Send push notification
         fetch("/api/notifications/send", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2351,7 +2348,14 @@ export default function App() {
         }).catch(err => console.error("Failed to push schedule conflict notification", err));
       }
     });
-  }, [graphConflicts, user]);
+  }, [graphConflicts, user, isPushEnabled]);
+
+  useEffect(() => {
+    if (isPushEnabled) {
+      // Reset ref supaya semua conflict aktif dikirim ulang notifnya
+      notifiedConflictsRef.current = new Set();
+    }
+  }, [isPushEnabled]);
 
 
 
