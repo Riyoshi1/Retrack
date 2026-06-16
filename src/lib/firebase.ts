@@ -1,6 +1,6 @@
 import { initializeApp } from "firebase/app";
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut } from "firebase/auth";
-import { getMessaging, getToken, onMessage } from "firebase/messaging";
+import { getMessaging, getToken, deleteToken, onMessage } from "firebase/messaging";
 import { getFirestore, collection, doc, setDoc, deleteDoc, getDocs, query, where } from "firebase/firestore";
 
 // Client-side Firebase Configuration (Provided by User)
@@ -51,10 +51,19 @@ export const requestNotificationPermissionAndGetToken = async (): Promise<string
       // Service worker registration for FCM
       let swRegistration: ServiceWorkerRegistration | undefined;
       try {
-        swRegistration = await navigator.serviceWorker.register("/firebase-messaging-sw.js");
+        await navigator.serviceWorker.register("/firebase-messaging-sw.js");
+        swRegistration = await navigator.serviceWorker.ready;
         console.log("Service Worker registered successfully:", swRegistration);
       } catch (swErr) {
         console.error("Service Worker registration failed:", swErr);
+      }
+
+      // 1. Hapus cache token lama untuk mencegah Third party auth error
+      try {
+        await deleteToken(messaging);
+        console.log("Old token deleted from browser cache");
+      } catch (_) {
+        // Token belum ada, abaikan
       }
 
       const currentToken = await getToken(messaging, {
